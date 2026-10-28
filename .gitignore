@@ -1,0 +1,7 @@
+**/bin/
+**/obj/
+.vs/
+*.user
+/publish/
+/image/
+/app.log

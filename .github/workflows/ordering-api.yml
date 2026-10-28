@@ -1,0 +1,114 @@
+name: Ordering API CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Restore and compile once
+        run: |
+          dotnet restore Ordering.API/Ordering.API.csproj
+          dotnet build Ordering.API/Ordering.API.csproj -c Release --no-restore -p:UseAppHost=false
+          dotnet publish Ordering.API/Ordering.API.csproj -c Release --no-build --no-restore -p:UseAppHost=false -o publish
+      - name: Test published application over HTTP
+        shell: bash
+        run: bash scripts/test-published.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ordering-api-publish
+          path: publish/
+          if-no-files-found: error
+          retention-days: 1
+
+  docker:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      image-id: ${{ steps.image.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ordering-api-publish
+          path: publish
+      - name: Package compiled application
+        run: docker build --file Dockerfile.ci --tag ordering-api:validated .
+      - name: Smoke test final image
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker logs ordering-api-smoke || true; docker rm -f ordering-api-smoke || true' EXIT
+          docker run --detach --name ordering-api-smoke --publish 127.0.0.1:8080:8080 ordering-api:validated
+          bash scripts/smoke-test.sh http://127.0.0.1:8080
+      - name: Export validated image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "id=$(docker image inspect ordering-api:validated --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+          mkdir image
+          docker save --output image/ordering-api.tar ordering-api:validated
+          cd image
+          sha256sum ordering-api.tar > ordering-api.tar.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ordering-api-image
+          path: image/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    # Disabled until explicitly authorized and enabled by a repository administrator.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_IMAGE_PUBLISH == 'true'
+    needs: docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ordering-api-image
+          path: image
+      - name: Verify and load the validated image
+        env:
+          EXPECTED_IMAGE_ID: ${{ needs.docker.outputs.image-id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd image
+          sha256sum --check ordering-api.tar.sha256
+          docker load --input ordering-api.tar
+          test "$(docker image inspect ordering-api:validated --format '{{.Id}}')" = "$EXPECTED_IMAGE_ID"
+      - name: Push without rebuilding
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker logout ghcr.io' EXIT
+          image="ghcr.io/${GITHUB_REPOSITORY,,}/ordering-api:sha-${GITHUB_SHA}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag ordering-api:validated "$image"
+          docker push "$image"
