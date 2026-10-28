@@ -47,3 +47,5 @@ O arquivo de projeto é copiado antes do código para aproveitar o cache de rest
 O Dockerfile usa tags de versão 8.0 para receber atualizações; para releases
 reprodutíveis, registre e fixe os digests das imagens base validadas.
 O build baixa as imagens base e pode consultar o NuGet; não publica a imagem.
+
+Testar PR.
