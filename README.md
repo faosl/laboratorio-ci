@@ -11,6 +11,8 @@ os testes na imagem final. O Dockerfile original mantém o build local completo.
 Após o smoke test, a imagem é salva com `docker save` e transferida como artefato.
 O job `attest` depende de `docker`, valida o SHA-256 e gera um Artifact Attestation
 de proveniência para `image/ordering-api.tar` usando `actions/attest@v4`.
+Logo após gerar, verifica o bundle desse atestamento com `gh attestation verify`,
+exigindo o repositório e workflow esperados; uma falha bloqueia o job `publish`.
 Ele recebe `id-token: write` e `attestations: write`; PRs de forks não executam
 esse job por não terem essas permissões. O atestamento fica associado ao repositório
 no GitHub e se refere ao arquivo exportado, não ao manifesto da imagem no registry.

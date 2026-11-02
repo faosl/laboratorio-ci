@@ -99,9 +99,15 @@ jobs:
         working-directory: image
         run: sha256sum --check ordering-api.tar.sha256
       - name: Attest exported image provenance
+        id: provenance
         uses: actions/attest@v4
         with:
           subject-path: image/ordering-api.tar
+      - name: Verify exported image provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ATTESTATION_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: gh attestation verify image/ordering-api.tar --bundle "$ATTESTATION_BUNDLE" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ordering-api.yml"
 
   publish:
     # Disabled until explicitly authorized and enabled by a repository administrator.
