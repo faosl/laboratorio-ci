@@ -78,22 +78,53 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  publish:
-    # Disabled until explicitly authorized and enabled by a repository administrator.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_IMAGE_PUBLISH == 'true'
+  attest:
+    # Fork pull requests cannot obtain the write permissions required for attestation.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     needs: docker
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      image-id: ${{ needs.docker.outputs.image-id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ordering-api-image
+          path: image
+      - name: Verify exported image checksum
+        working-directory: image
+        run: sha256sum --check ordering-api.tar.sha256
+      - name: Attest exported image provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: image/ordering-api.tar
+
+  publish:
+    # Disabled until explicitly authorized and enabled by a repository administrator.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_IMAGE_PUBLISH == 'true'
+    needs: attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
       packages: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: ordering-api-image
           path: image
+      - name: Verify exported image provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh attestation verify image/ordering-api.tar --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ordering-api.yml"
       - name: Verify and load the validated image
         env:
-          EXPECTED_IMAGE_ID: ${{ needs.docker.outputs.image-id }}
+          EXPECTED_IMAGE_ID: ${{ needs.attest.outputs.image-id }}
         shell: bash
         run: |
           set -euo pipefail
