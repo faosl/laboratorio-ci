@@ -9,13 +9,19 @@ usa `Dockerfile.ci` para empacotar esses mesmos binários sem recompilar e repet
 os testes na imagem final. O Dockerfile original mantém o build local completo.
 
 Após o smoke test, a imagem é salva com `docker save` e transferida como artefato.
-`publish` valida o SHA-256 do arquivo e o ID da imagem antes de carregar, retaggear
+O job `attest` depende de `docker`, valida o SHA-256 e gera um Artifact Attestation
+de proveniência para `image/ordering-api.tar` usando `actions/attest@v4`.
+Ele recebe `id-token: write` e `attestations: write`; PRs de forks não executam
+esse job por não terem essas permissões. O atestamento fica associado ao repositório
+no GitHub e se refere ao arquivo exportado, não ao manifesto da imagem no registry.
+`publish` depende de `attest` e verifica a proveniência com `gh attestation verify`,
+exigindo o repositório e workflow esperados. Também valida o SHA-256 e o ID antes de carregar, retaggear
 e enviar a mesma imagem ao GHCR; não executa build. Os artefatos duram um dia.
 
 A publicação está **desativada por padrão**. Somente após autorização explícita,
 um administrador deve configurar a variável de repositório `ENABLE_IMAGE_PUBLISH`
 como `true`. O job só poderá então executar em um próximo push na `main`, após
-o sucesso de `docker`. Não há gatilho manual nem publicação em Pull Requests.
+o sucesso de `attest`. Não há gatilho manual nem publicação em Pull Requests.
 O destino é `ghcr.io/<owner>/<repo>/ordering-api:sha-<commit>` e somente `publish`
 recebe `packages: write`. As configurações do repositório/organização devem
 permitir publicação no GHCR usando `GITHUB_TOKEN`.
