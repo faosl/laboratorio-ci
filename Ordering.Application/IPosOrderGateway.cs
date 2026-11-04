@@ -1,13 +1,6 @@
 using Ordering.Dominio;
 
-namespace Ordering.API;
-
-public enum PosDispatchStatus
-{
-    ReceiptConfirmed,
-    Rejected,
-    OutcomeUnknown
-}
+namespace Ordering.Application;
 
 public interface IPosOrderGateway
 {
