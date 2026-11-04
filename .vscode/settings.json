@@ -1,0 +1,18 @@
+{
+  "[csharp]": {
+    "editor.quickSuggestions": {
+      "other": "on",
+      "comments": "off",
+      "strings": "off"
+    },
+    "editor.suggestOnTriggerCharacters": true,
+    "editor.parameterHints.enabled": true,
+    "editor.wordBasedSuggestions": "off",
+    "editor.suggest.showMethods": true,
+    "editor.suggest.showProperties": true,
+    "editor.suggest.showFields": true,
+    "editor.suggest.showClasses": true,
+    "editor.suggest.showKeywords": true,
+    "editor.suggest.showSnippets": true
+  }
+}
