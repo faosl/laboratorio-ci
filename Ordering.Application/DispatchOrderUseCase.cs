@@ -8,6 +8,8 @@ public sealed class DispatchOrderUseCase
 
     public DispatchOrderUseCase(IPosOrderGateway posOrderGateway)
     {
+        ArgumentNullException.ThrowIfNull(posOrderGateway);
+
         _posOrderGateway = posOrderGateway;
     }
 
