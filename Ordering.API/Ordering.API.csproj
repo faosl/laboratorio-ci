@@ -4,4 +4,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Ordering.Dominio\Ordering.Dominio.csproj" />
+  </ItemGroup>
 </Project>
