@@ -3,8 +3,9 @@
 ## GitHub Actions
 
 `.github/workflows/ordering-api.yml` executa `test` e `docker` em Pull Requests
-e pushes na `main`. Não há suíte de testes de domínio: o job `test` compila uma
-vez e executa testes HTTP de `/health` e `/` na saída publicada. O job `docker`
+e pushes na `main`. O job `test` executa os testes unitários de domínio,
+aplicação e contratos de parceiros, compila a API uma vez e executa testes HTTP
+de `/health` e `/` na saída publicada. O job `docker`
 usa `Dockerfile.ci` para empacotar esses mesmos binários sem recompilar e repete
 os testes na imagem final. O Dockerfile original mantém o build local completo.
 
