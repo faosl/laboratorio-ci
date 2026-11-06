@@ -20,6 +20,22 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
+      - name: Run domain unit tests
+        run: |
+          dotnet restore Ordering.Dominio.Tests/Ordering.Dominio.Tests.csproj
+          dotnet test Ordering.Dominio.Tests/Ordering.Dominio.Tests.csproj -c Release --no-restore
+      - name: Run application unit tests
+        run: |
+          dotnet restore Ordering.Application.Tests/Ordering.Application.Tests.csproj
+          dotnet test Ordering.Application.Tests/Ordering.Application.Tests.csproj -c Release --no-restore
+      - name: Run partner contract unit tests
+        run: |
+          dotnet restore Ordering.Contracts.Partners.Tests/Ordering.Contracts.Partners.Tests.csproj
+          dotnet test Ordering.Contracts.Partners.Tests/Ordering.Contracts.Partners.Tests.csproj -c Release --no-restore
+      - name: Run Uber Eats integration unit tests
+        run: |
+          dotnet restore Ordering.Integrations.UberEats.Tests/Ordering.Integrations.UberEats.Tests.csproj
+          dotnet test Ordering.Integrations.UberEats.Tests/Ordering.Integrations.UberEats.Tests.csproj -c Release --no-restore
       - name: Restore and compile once
         run: |
           dotnet restore Ordering.API/Ordering.API.csproj
@@ -78,22 +94,59 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  publish:
-    # Disabled until explicitly authorized and enabled by a repository administrator.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_IMAGE_PUBLISH == 'true'
+  attest:
+    # Fork pull requests cannot obtain the write permissions required for attestation.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     needs: docker
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      image-id: ${{ needs.docker.outputs.image-id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ordering-api-image
+          path: image
+      - name: Verify exported image checksum
+        working-directory: image
+        run: sha256sum --check ordering-api.tar.sha256
+      - name: Attest exported image provenance
+        id: provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: image/ordering-api.tar
+      - name: Verify exported image provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ATTESTATION_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: gh attestation verify image/ordering-api.tar --bundle "$ATTESTATION_BUNDLE" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ordering-api.yml"
+
+  publish:
+    # Disabled until explicitly authorized and enabled by a repository administrator.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_IMAGE_PUBLISH == 'true'
+    needs: attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
       packages: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: ordering-api-image
           path: image
+      - name: Verify exported image provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh attestation verify image/ordering-api.tar --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ordering-api.yml"
       - name: Verify and load the validated image
         env:
-          EXPECTED_IMAGE_ID: ${{ needs.docker.outputs.image-id }}
+          EXPECTED_IMAGE_ID: ${{ needs.attest.outputs.image-id }}
         shell: bash
         run: |
           set -euo pipefail
