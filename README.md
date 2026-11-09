@@ -1,5 +1,24 @@
 # Ordering.API — laboratório local
 
+## Adaptador HTTP Uber Eats — somente laboratório
+
+`POST /webhooks/uber-eats/orders` é mapeado apenas no ambiente `Laboratory`.
+O host deve fornecer `UberEatsSharedSecret` por DI; a aplicação não carrega nem
+valida o segredo de produção nesta fase. Os testes usam um segredo sintético.
+Não configurar esta rota como destino de webhooks reais nem expô-la em implantação operacional.
+
+O adaptador aceita `application/json` com UTF-8, sem `Content-Encoding`, até
+1 MiB (inclusive sem `Content-Length`), e passa os bytes originais ao orquestrador.
+Assinatura inválida retorna 403; JSON/UTF-8 inválido, 400; semântica inválida, 422;
+conteúdo não suportado, 415; tamanho excedido, 413; falha inesperada, 500.
+Uma notificação válida retorna **503**, pois verificação e mapeamento não são
+registro durável. A ausência do segredo também retorna 503.
+
+R1 continua pendente: não há persistência, deduplicação, mensageria ou POS.
+Testes HTTP aprovados não demonstram recuperação após queda nem prontidão operacional.
+Execute `dotnet test Ordering.API.Tests/Ordering.API.Tests.csproj -c Release`.
+A CI inclui esses testes no job `test`, sem alterar políticas de publicação.
+
 ## GitHub Actions
 
 `.github/workflows/ordering-api.yml` executa `test` e `docker` em Pull Requests
