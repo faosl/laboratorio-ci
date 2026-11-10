@@ -6,5 +6,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Ordering.Dominio\Ordering.Dominio.csproj" />
+    <ProjectReference Include="..\Ordering.Contracts.Partners\Ordering.Contracts.Partners.csproj" />
   </ItemGroup>
 </Project>

@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Ordering.Application/Ordering.Application.csproj" />
+    <PackageReference Include="Npgsql" Version="8.0.8" />
+    <EmbeddedResource Include="Migrations/*.sql" />
+    <InternalsVisibleTo Include="Ordering.Infrastructure.PostgreSql.Tests" />
+  </ItemGroup>
+</Project>
