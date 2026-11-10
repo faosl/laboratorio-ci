@@ -13,6 +13,18 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    services:
+      inbox-postgres:
+        image: postgres:17.7-bookworm
+        env:
+          POSTGRES_USER: inbox_test
+          POSTGRES_PASSWORD: ci_ephemeral_only
+          POSTGRES_DB: inbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U inbox_test -d inbox_test"
+          --health-interval 2s --health-timeout 3s --health-retries 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,6 +52,12 @@ jobs:
         run: |
           dotnet restore Ordering.API.Tests/Ordering.API.Tests.csproj
           dotnet test Ordering.API.Tests/Ordering.API.Tests.csproj -c Release --no-restore
+      - name: Run PostgreSQL Inbox integration tests
+        env:
+          INBOX_TEST_CONNECTION: Host=localhost;Port=5432;Database=inbox_test;Username=inbox_test;Password=ci_ephemeral_only;Enlist=false
+        run: |
+          dotnet restore Ordering.Infrastructure.PostgreSql.Tests/Ordering.Infrastructure.PostgreSql.Tests.csproj
+          dotnet test Ordering.Infrastructure.PostgreSql.Tests/Ordering.Infrastructure.PostgreSql.Tests.csproj -c Release --no-restore
       - name: Restore and compile once
         run: |
           dotnet restore Ordering.API/Ordering.API.csproj
