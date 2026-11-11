@@ -14,9 +14,11 @@ public interface IInboxStore
     /// Receipt time and generated id are not compared. No existing content/state is changed.
     /// OutcomeUnknown requires reconciliation; cancellation during commit does not imply rollback.
     /// Failures before commit are propagated. This port does not authenticate notifications.
+    /// Inserted and AlreadyExists require confirmed durable receipt, not mere row visibility.
     /// </summary>
     Task<InboxRegistrationResult> RegisterAsync(InboxNotification notification, CancellationToken cancellationToken);
 
-    /// <summary>Reads the primary. Absence is not proof that an in-flight commit failed.</summary>
+    /// <summary>Reads the primary; a returned entry requires a successful local durability barrier.
+    /// Absence is not proof that an in-flight commit failed.</summary>
     Task<InboxEntry?> GetByKeyAsync(InboxKey key, CancellationToken cancellationToken);
 }

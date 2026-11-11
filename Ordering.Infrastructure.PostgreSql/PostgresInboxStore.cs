@@ -23,6 +23,16 @@ public sealed class PostgresInboxStore : IInboxStore
 
     public async Task<InboxRegistrationResult> RegisterAsync(InboxNotification notification, CancellationToken cancellationToken)
     {
+        try { return await RegisterCoreAsync(notification, cancellationToken); }
+        catch (NpgsqlException error) when (error.IsTransient)
+        {
+            // Keep provider details out of Application and HTTP responses/logs.
+            throw new InboxStorageUnavailableException();
+        }
+    }
+
+    private async Task<InboxRegistrationResult> RegisterCoreAsync(InboxNotification notification, CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(notification);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
         await RequireDurablePrimaryAsync(connection, cancellationToken);

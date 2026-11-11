@@ -1,9 +1,6 @@
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHealthChecks();
-builder.Services.AddSingleton<Ordering.Integrations.UberEats.UberEatsSignatureVerifier>();
-builder.Services.AddSingleton<Ordering.Integrations.UberEats.UberEatsOrderNotificationDeserializer>();
-builder.Services.AddSingleton<Ordering.Integrations.UberEats.UberEatsOrderNotificationMapper>();
-builder.Services.AddSingleton<Ordering.Integrations.UberEats.UberEatsOrderNotificationOrchestrator>();
+Ordering.API.UberEatsServices.AddUberEatsOrchestrator(builder.Services);
 
 var app = builder.Build();
 app.MapGet("/", () => Results.Ok(new { service = "Ordering.API" }));
