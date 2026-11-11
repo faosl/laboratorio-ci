@@ -3,6 +3,8 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Ordering.Integrations.UberEats;
+using Ordering.Application.Inbox;
+using Ordering.Contracts.Partners;
 
 namespace Ordering.API;
 
@@ -11,7 +13,10 @@ public static class UberEatsOrderEndpoint
     public const int MaxBodyBytes = 1024 * 1024;
     public const string Route = "/webhooks/uber-eats/orders";
 
-    public static void Map(WebApplication app) => app.MapPost(Route, HandleAsync);
+    public static void Map(WebApplication app)
+    {
+        if (app.Environment.IsEnvironment("Laboratory")) app.MapPost(Route, HandleAsync);
+    }
 
     private static async Task<IResult> HandleAsync(HttpContext context,
         UberEatsOrderNotificationOrchestrator orchestrator)
@@ -47,9 +52,11 @@ public static class UberEatsOrderEndpoint
             var secret = context.RequestServices.GetService<UberEatsSharedSecret>();
             if (secret is null) return Error(503);
 
+            var original = body.ToArray();
+            OrderNotification notification;
             try
             {
-                orchestrator.Process(body.ToArray(), signatures[0], secret.Bytes);
+                notification = orchestrator.Process(original, signatures[0], secret.Bytes);
             }
             catch (UberEatsInvalidSignatureException) { return Error(403); }
             catch (DecoderFallbackException) { return Error(400); }
@@ -57,8 +64,32 @@ public static class UberEatsOrderEndpoint
             catch (ArgumentException exception) when (exception.ParamName is "notification" or "eventId" or "orderId")
             { return Error(422); }
 
-            // Mapping is not durable receipt. Never acknowledge until R1 exists.
-            return Error(503);
+            var identity = context.RequestServices.GetService<UberEatsIntegrationIdentity>();
+            var useCase = context.RequestServices.GetService<RegisterAuthenticatedOrderNotificationUseCase>();
+            if (identity is null || useCase is null) return Error(503);
+
+            // Validate only client-supplied identifiers here; host configuration is validated separately.
+            if (notification.EventId.Length > 200 || notification.EventId.Contains('\0')
+                || notification.OrderId.Length > 200 || notification.OrderId.Contains('\0')) return Error(422);
+
+            InboxRegistrationResult result;
+            try
+            {
+                result = await useCase.ExecuteAsync(notification, original, UberEatsIntegrationIdentity.PartnerId,
+                    identity.IntegrationScope, context.RequestAborted);
+            }
+            catch (InboxStorageUnavailableException) { return Error(503); }
+            catch (IOException) { return Error(503); }
+            catch (TimeoutException) { return Error(503); }
+
+            return result.Status switch
+            {
+                InboxRegistrationStatus.Inserted or InboxRegistrationStatus.AlreadyExists
+                    when result.InboxId is not null => Results.Ok(),
+                InboxRegistrationStatus.Conflict => Error(409),
+                InboxRegistrationStatus.OutcomeUnknown => Error(503),
+                _ => Error(500)
+            };
         }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { throw; }
         catch (OperationCanceledException) { return Error(503); }

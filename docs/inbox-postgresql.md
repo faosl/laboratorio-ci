@@ -1,5 +1,8 @@
 # Inbox PostgreSQL — primeiro incremento
 
+Este documento descreve a base de armazenamento e as evidências do primeiro incremento.
+A integração posterior está em [Webhook HTTP com Inbox](uber-eats-http-inbox.md).
+
 A porta `IInboxStore` pertence a Application; PostgreSQL/Npgsql pertencem exclusivamente
 ao projeto de infraestrutura. O domínio, os contratos existentes, o adaptador Uber e o
 endpoint não foram alterados. A API não referencia a infraestrutura nem provisiona o banco.
@@ -124,8 +127,9 @@ cliente demonstra recuperação sem memória local; não demonstra recuperação
 após crash de sistema operacional. Perda de disco, restauração de backup, flush físico,
 partições de rede e failover exigem testes representativos futuros.
 
-O endpoint continua retornando 503. R1 não está demonstrado de ponta a ponta; não há
-ACK operacional, processamento, POS, Outbox, Kafka ou efeitos externos idempotentes.
+A API padrão continua retornando 503 sem Inbox configurada. O incremento HTTP
+descrito abaixo acrescenta ACK durável exclusivamente no host de laboratório;
+não há ACK operacional autorizado, processamento, POS, Outbox ou Kafka.
 
 ## Resultado da execução local
 
