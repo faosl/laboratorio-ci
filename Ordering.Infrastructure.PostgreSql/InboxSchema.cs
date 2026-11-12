@@ -16,17 +16,21 @@ public static class InboxSchema
                 version integer PRIMARY KEY, applied_at_utc timestamptz NOT NULL DEFAULT clock_timestamp());
             """, connection, transaction);
         await setup.ExecuteNonQueryAsync(cancellationToken);
-        await using var version = new NpgsqlCommand(
-            "SELECT EXISTS (SELECT 1 FROM public.ordering_inbox_schema_version WHERE version = 1)", connection, transaction);
-        if (!(bool)(await version.ExecuteScalarAsync(cancellationToken))!)
+        // Applied scripts are immutable; pending versions run in order under the same migration lock.
+        foreach (var (number, name) in new[] { (1, "001_inbox.sql"), (2, "002_inbox_processing.sql") })
         {
+            await using var version = new NpgsqlCommand(
+                "SELECT EXISTS (SELECT 1 FROM public.ordering_inbox_schema_version WHERE version = $1)", connection, transaction);
+            version.Parameters.AddWithValue(number);
+            if ((bool)(await version.ExecuteScalarAsync(cancellationToken))!) continue;
             using var stream = typeof(InboxSchema).Assembly.GetManifestResourceStream(
-                "Ordering.Infrastructure.PostgreSql.Migrations.001_inbox.sql")!;
+                "Ordering.Infrastructure.PostgreSql.Migrations." + name)!;
             using var reader = new StreamReader(stream);
             await using var migration = new NpgsqlCommand(await reader.ReadToEndAsync(cancellationToken), connection, transaction);
             await migration.ExecuteNonQueryAsync(cancellationToken);
             await using var record = new NpgsqlCommand(
-                "INSERT INTO public.ordering_inbox_schema_version(version) VALUES (1)", connection, transaction);
+                "INSERT INTO public.ordering_inbox_schema_version(version) VALUES ($1)", connection, transaction);
+            record.Parameters.AddWithValue(number);
             await record.ExecuteNonQueryAsync(cancellationToken);
         }
         await transaction.CommitAsync(cancellationToken);

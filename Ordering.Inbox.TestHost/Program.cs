@@ -10,6 +10,14 @@ if (args.Length == 1 && args[0] == "migrate")
     await InboxSchema.ApplyAsync(source);
     return 0;
 }
+// Single-shot test probe, not a background worker. Process exit intentionally leaves the lease behind.
+if (args.Length == 2 && args[0] == "acquire")
+{
+    var result = await new PostgresInboxProcessingStore(source).TryAcquireAsync(args[1], TimeSpan.FromMinutes(1), CancellationToken.None);
+    if (result.Status != InboxAcquisitionStatus.Acquired) return 4;
+    Console.WriteLine($"{result.Work!.Lease.InboxId}|{result.Work.Lease.Generation}");
+    return 0;
+}
 if (args.Length != 2 || args[0] is not ("write" or "read")) return 1;
 var store = new PostgresInboxStore(source);
 var key = new InboxKey("restart-partner", "test", args[1]);
