@@ -113,6 +113,41 @@ public sealed class UberEatsInboxHttpTests(DatabaseFixture database) : IClassFix
         Assert.NotNull(await Read(id));
     }
 
+    [Theory]
+    [InlineData("Processing")]
+    [InlineData("RetryScheduled")]
+    [InlineData("Completed")]
+    public async Task Redelivery_PreservesProcessingMetadataAndDurableAcknowledgment(string state)
+    {
+        using var host = Host(); using var client = host.CreateClient();
+        var id = Guid.NewGuid().ToString(); var body = Body(id);
+        await Send(client, body, 200);
+        var entry = (await Read(id))!;
+        await using (var prioritize = database.Source.CreateCommand("UPDATE public.ordering_inbox SET received_at_utc = '1900-01-01Z' WHERE inbox_id = $1"))
+        {
+            prioritize.Parameters.AddWithValue(entry.InboxId);
+            await prioritize.ExecuteNonQueryAsync();
+        }
+        var processing = new PostgresInboxProcessingStore(database.Source);
+        var acquired = await processing.TryAcquireAsync("http-regression", TimeSpan.FromMinutes(1), CancellationToken.None);
+        Assert.Equal(entry.InboxId, acquired.Work!.Lease.InboxId);
+        if (state == "RetryScheduled")
+            Assert.Equal(InboxMutationStatus.Succeeded, (await processing.ScheduleRetryAsync(acquired.Work.Lease, TimeSpan.FromDays(1), CancellationToken.None)).Status);
+        if (state == "Completed")
+            Assert.Equal(InboxMutationStatus.Succeeded, (await processing.CompleteAsync(acquired.Work.Lease, CancellationToken.None)).Status);
+        async Task<string> Snapshot()
+        {
+            await using var command = database.Source.CreateCommand("SELECT row_to_json(i)::text FROM public.ordering_inbox i WHERE inbox_id = $1");
+            command.Parameters.AddWithValue(entry.InboxId);
+            return (string)(await command.ExecuteScalarAsync())!;
+        }
+        var before = await Snapshot();
+        await Send(client, body, 200);
+        await Send(client, Body(id, "conflict"), 409);
+        Assert.Equal(before, await Snapshot());
+        Assert.Equal(state, (await Read(id))!.State);
+    }
+
     [Fact]
     public async Task ConcurrentIndependentHosts_CreateOneDurableRecord()
     {

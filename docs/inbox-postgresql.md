@@ -1,5 +1,8 @@
 # Inbox PostgreSQL — primeiro incremento
 
+Este documento registra o incremento original de recebimento (esquema v1). A evolução
+atual para v2, com estados e reservas, está em [Durable Inbox processing coordination](inbox-processing-leases.md).
+
 Este documento descreve a base de armazenamento e as evidências do primeiro incremento.
 A integração posterior está em [Webhook HTTP com Inbox](uber-eats-http-inbox.md).
 

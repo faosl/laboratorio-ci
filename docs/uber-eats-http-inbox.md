@@ -1,5 +1,8 @@
 # Webhook HTTP com Inbox no laboratório
 
+A coordenação persistente de processamento foi acrescentada separadamente, preservando
+este recebimento: [leases e fencing tokens](inbox-processing-leases.md). Não há worker executável.
+
 O host `Ordering.API.LaboratoryHost` executa o fluxo completo em .NET 8, reutilizando
 o endpoint da API. A API continua sem referência a PostgreSQL e sem provisionamento
 automático. Sua execução padrão, sem Inbox configurada, retorna 503 para notificações válidas.

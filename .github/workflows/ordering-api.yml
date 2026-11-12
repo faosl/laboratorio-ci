@@ -52,7 +52,7 @@ jobs:
         run: |
           dotnet restore Ordering.API.Tests/Ordering.API.Tests.csproj
           dotnet test Ordering.API.Tests/Ordering.API.Tests.csproj -c Release --no-restore
-      - name: Run PostgreSQL Inbox and durable laboratory HTTP integration tests
+      - name: Run PostgreSQL Inbox leases, fencing and durable HTTP integration tests
         env:
           INBOX_TEST_CONNECTION: Host=localhost;Port=5432;Database=inbox_test;Username=inbox_test;Password=ci_ephemeral_only;Enlist=false
         run: |
