@@ -6,6 +6,9 @@ Application port `IInboxProcessingStore` owns acquisition, renewal, completion a
 `PostgresInboxProcessingStore` implements it using Npgsql. Domain, normalized partner contracts,
 HTTP responses and publication policies are unchanged.
 
+The Application-only [single-notification coordinator](inbox-processing-coordinator.md) builds on
+this unchanged port to supervise a pluggable processor, renewal, finalization and bounded shutdown.
+
 ## State and lease model
 
 - `Pending`: eligible for initial acquisition.
