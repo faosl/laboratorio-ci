@@ -33,9 +33,11 @@ public sealed class InboxProcessingCoordinator
         InboxProcessingOptions options, TimeProvider time)
     {
         private readonly CancellationTokenSource _calls = new();
+        private readonly CancellationTokenSource _processingCalls = new();
         private readonly CancellationTokenSource _timers = new();
         private readonly List<Task> _started = [];
         private InboxLease? _lease;
+        private Task? _shutdownDeadline;
 
         public async Task<InboxCoordinationResult> RunAsync(string owner, CancellationToken cancellationToken)
         {
@@ -66,7 +68,7 @@ public sealed class InboxProcessingCoordinator
                 if (cancellationToken.IsCancellationRequested)
                     return await StopAsync(Result(InboxCoordinationStatus.Cancelled, InboxCoordinationStage.Processing));
 
-                var processing = Start(() => processor.ProcessAsync(work.Content, _calls.Token));
+                var processing = Start(() => processor.ProcessAsync(work.Content, _processingCalls.Token));
                 var renewalDue = Delay(options.RenewalInterval);
                 Task<Call<InboxMutationResult>>? renewal = null;
                 Task? renewalDeadline = null;
@@ -82,9 +84,9 @@ public sealed class InboxProcessingCoordinator
                         return await FinishAsync(await terminal, terminalStage);
 
                     if (cancellationToken.IsCancellationRequested)
-                        return await StopAsync(terminal is null
-                            ? Result(InboxCoordinationStatus.Cancelled, InboxCoordinationStage.Processing)
-                            : Unknown(terminalStage), terminal, terminalStage);
+                        return terminal is null
+                            ? await DrainProcessingAsync(processing, renewalDue, renewal, renewalDeadline)
+                            : await StopAsync(Unknown(terminalStage), terminal, terminalStage);
 
                     if (renewal?.IsCompleted == true)
                     {
@@ -161,6 +163,53 @@ public sealed class InboxProcessingCoordinator
             }
         }
 
+        private async Task<InboxCoordinationResult> DrainProcessingAsync(
+            Task<Call<InboxNotificationProcessingResult>> processing, Task renewalDue,
+            Task<Call<InboxMutationResult>>? renewal, Task? renewalDeadline)
+        {
+            BeginShutdown();
+            var result = Result(InboxCoordinationStatus.Cancelled, InboxCoordinationStage.Processing);
+            // The same supervisor retains the existing interval and any in-flight renewal.
+            // Caller cancellation asks the processor to stop; it does not revoke store authority.
+            while (!processing.IsCompleted && !_shutdownDeadline!.IsCompleted)
+            {
+                if (renewal?.IsCompleted == true)
+                {
+                    var renewed = await renewal;
+                    if (renewed.Error is not null || renewed.Value!.Status != InboxMutationStatus.Succeeded)
+                    {
+                        result = MutationResult(renewed, InboxCoordinationStage.Renewal);
+                        break;
+                    }
+                    renewal = null;
+                    renewalDeadline = null;
+                    renewalDue = Delay(options.RenewalInterval);
+                }
+
+                if (renewalDeadline?.IsCompleted == true)
+                {
+                    result = Unknown(InboxCoordinationStage.Renewal,
+                        new TimeoutException("Renewal confirmation timed out."));
+                    break;
+                }
+
+                if (renewal is null && renewalDue.IsCompleted)
+                {
+                    // Recheck the stop signals at the boundary that starts a new operation.
+                    if (processing.IsCompleted || _shutdownDeadline.IsCompleted) break;
+                    (renewal, renewalDeadline) = StartStore(() => store.RenewAsync(_lease!, options.LeaseDuration, _calls.Token));
+                    continue;
+                }
+
+                if (renewal is null)
+                    await Task.WhenAny(processing, _shutdownDeadline, renewalDue);
+                else
+                    await Task.WhenAny(processing, _shutdownDeadline, renewal, renewalDeadline!);
+            }
+            // No terminal write is started after caller cancellation, even on a late success/retry.
+            return await StopAsync(result);
+        }
+
         private Task Delay(TimeSpan duration) => Task.Delay(duration, time, _timers.Token);
 
         private (Task<Call<T>> Call, Task Deadline) StartStore<T>(Func<Task<T>> call)
@@ -222,16 +271,22 @@ public sealed class InboxProcessingCoordinator
         private Task<InboxCoordinationResult> FinishAsync(Call<InboxMutationResult> call, InboxCoordinationStage stage) =>
             StopAsync(MutationResult(call, stage));
 
+        private void BeginShutdown()
+        {
+            if (_shutdownDeadline is not null) return;
+            // One budget covers both lease-maintaining drain and final task/callback observation.
+            _shutdownDeadline = Delay(options.ShutdownTimeout);
+            Track(ObserveAsync(_processingCalls.CancelAsync()));
+        }
+
         private async Task<InboxCoordinationResult> StopAsync(InboxCoordinationResult result,
             Task<Call<InboxMutationResult>>? terminal = null, InboxCoordinationStage terminalStage = InboxCoordinationStage.Completion)
         {
             // CancelAsync also bounds shutdown when a participant blocks inside a cancellation callback.
+            BeginShutdown();
             Track(ObserveAsync(_calls.CancelAsync()));
             var quiescence = SettleAsync();
-            using var deadlineCancellation = new CancellationTokenSource();
-            var deadline = Task.Delay(options.ShutdownTimeout, time, deadlineCancellation.Token);
-            await Task.WhenAny(quiescence, deadline);
-            await deadlineCancellation.CancelAsync();
+            await Task.WhenAny(quiescence, _shutdownDeadline!);
 
             if (terminal?.IsCompleted == true && (await terminal).Value?.Status == InboxMutationStatus.Succeeded)
                 result = MutationResult(await terminal, terminalStage);
@@ -242,6 +297,7 @@ public sealed class InboxProcessingCoordinator
         {
             await Task.WhenAll(_started);
             _calls.Dispose();
+            _processingCalls.Dispose();
         }
 
         private static async Task ObserveAsync(Task task)

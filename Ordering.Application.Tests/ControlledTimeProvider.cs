@@ -24,13 +24,18 @@ internal sealed class ControlledTimeProvider : TimeProvider
 
     public async Task<ControlledTimer> NextTimerAsync(TimeSpan dueTime)
     {
-        Channel<ControlledTimer> queue;
-        lock (_gate) queue = Queue(dueTime);
         while (true)
         {
-            var timer = await queue.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            var timer = await NextRegisteredTimerAsync(dueTime);
             if (timer.Active) return timer;
         }
+    }
+
+    public Task<ControlledTimer> NextRegisteredTimerAsync(TimeSpan dueTime)
+    {
+        Channel<ControlledTimer> queue;
+        lock (_gate) queue = Queue(dueTime);
+        return queue.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     public int ActiveTimerCount
@@ -48,7 +53,9 @@ internal sealed class ControlledTimeProvider : TimeProvider
     internal sealed class ControlledTimer(TimerCallback callback, object? state) : ITimer
     {
         private int _active = 1;
+        private readonly TaskCompletionSource _disposed = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool Active => Volatile.Read(ref _active) == 1;
+        public Task Disposed => _disposed.Task;
         public void Fire()
         {
             Assert.Equal(1, Interlocked.Exchange(ref _active, 0));
@@ -56,7 +63,11 @@ internal sealed class ControlledTimeProvider : TimeProvider
         }
 
         public bool Change(TimeSpan dueTime, TimeSpan period) => throw new NotSupportedException();
-        public void Dispose() => Interlocked.Exchange(ref _active, 0);
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _active, 0);
+            _disposed.TrySetResult();
+        }
         public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
     }
 }
