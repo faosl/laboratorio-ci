@@ -4,4 +4,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Ordering.Integrations.UberEats\Ordering.Integrations.UberEats.csproj" />
+    <ProjectReference Include="..\Ordering.Application\Ordering.Application.csproj" />
+    <ProjectReference Include="..\Ordering.Contracts.Partners\Ordering.Contracts.Partners.csproj" />
+  </ItemGroup>
 </Project>

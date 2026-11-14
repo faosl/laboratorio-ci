@@ -1,0 +1,19 @@
+services:
+  inbox-postgres:
+    image: postgres:17.7-bookworm
+    environment:
+      POSTGRES_USER: inbox_dev
+      POSTGRES_DB: inbox_dev
+      POSTGRES_PASSWORD: ${INBOX_POSTGRES_PASSWORD:?Set a local development password}
+    command: [postgres, -c, fsync=on, -c, full_page_writes=on, -c, synchronous_commit=on]
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - inbox-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U inbox_dev -d inbox_dev"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  inbox-postgres-data:
