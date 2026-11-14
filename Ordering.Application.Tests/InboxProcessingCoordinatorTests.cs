@@ -396,6 +396,234 @@ public sealed class InboxProcessingCoordinatorTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public async Task ShutdownKeepsRenewingSequentiallyWithAnIndependentStoreToken(bool renewalAlreadyInFlight)
+    {
+        var fixture = new Fixture(TimeSpan.FromSeconds(25));
+        var processing = Signal<InboxNotificationProcessingResult>();
+        var renewal = Signal<InboxMutationResult>();
+        var processorCancelled = Signal<bool>();
+        CancellationToken storeToken = default;
+        fixture.Processor.Process = token =>
+        {
+            token.Register(() => processorCancelled.TrySetResult(true));
+            return processing.Task;
+        };
+        fixture.Store.Renew = token => { storeToken = token; return renewal.Task; };
+        using var cancellation = new CancellationTokenSource();
+        var run = fixture.Run(cancellation.Token);
+        // CancelAsync may still be disposing the completed acquisition's timer on another task.
+        await (await fixture.Time.NextRegisteredTimerAsync(OperationTimeout)).Disposed.WaitAsync(TimeSpan.FromSeconds(10));
+        var firstInterval = await fixture.Time.NextTimerAsync(RenewalInterval);
+        ControlledTimeProvider.ControlledTimer? operationDeadline = null;
+        if (renewalAlreadyInFlight)
+        {
+            firstInterval.Fire();
+            await fixture.Store.RenewEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            operationDeadline = await fixture.Time.NextTimerAsync(OperationTimeout);
+        }
+        cancellation.Cancel();
+        await processorCancelled.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var shutdown = await fixture.Time.NextTimerAsync(TimeSpan.FromSeconds(25));
+        if (!renewalAlreadyInFlight)
+        {
+            Assert.True(firstInterval.Active); // Shutdown does not reset the existing interval.
+            firstInterval.Fire();
+            await fixture.Store.RenewEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            operationDeadline = await fixture.Time.NextTimerAsync(OperationTimeout);
+        }
+        Assert.True(operationDeadline!.Active); // An in-flight store budget is retained too.
+        Assert.True(fixture.Processor.Token.IsCancellationRequested);
+        Assert.False(storeToken.IsCancellationRequested);
+        Assert.False(run.IsCompleted);
+        Assert.Equal(1, fixture.Store.RenewCalls);
+
+        fixture.Store.Renew = token =>
+        {
+            Assert.False(token.IsCancellationRequested);
+            return Task.FromResult(Success());
+        };
+        renewal.SetResult(Success());
+        var secondInterval = await fixture.Time.NextTimerAsync(RenewalInterval);
+        await operationDeadline.Disposed.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.False(operationDeadline.Active);
+        Assert.Equal(1, fixture.Store.RenewCalls); // No second call until the next interval fires.
+        secondInterval.Fire();
+        var thirdInterval = await fixture.Time.NextTimerAsync(RenewalInterval);
+        Assert.Equal(2, fixture.Store.RenewCalls);
+        processing.SetResult(InboxNotificationProcessingResult.Succeeded);
+        var result = await Finished(run);
+        Assert.Equal(InboxCoordinationStatus.Cancelled, result.Status);
+        Assert.False(result.ShutdownTimedOut);
+        Assert.True(result.Quiescence.IsCompletedSuccessfully);
+        Assert.False(shutdown.Active);
+        Assert.False(thirdInterval.Active);
+        Assert.Equal(new[] { "acquire", "renew", "renew" }, fixture.Store.Calls);
+        Assert.Equal(0, fixture.Time.ActiveTimerCount);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProcessorCancellationCallbackCannotBlockLeaseMaintenanceOrEscapeObservation(bool blocks)
+    {
+        var fixture = new Fixture(TimeSpan.FromSeconds(25));
+        var processing = Signal<InboxNotificationProcessingResult>();
+        var entered = Signal<bool>();
+        using var release = new ManualResetEventSlim();
+        fixture.Processor.Process = token =>
+        {
+            token.Register(() =>
+            {
+                entered.TrySetResult(true);
+                if (blocks) release.Wait();
+                else throw new InvalidOperationException("cancellation callback failed");
+            });
+            return processing.Task;
+        };
+        fixture.Store.Renew = token =>
+        {
+            Assert.False(token.IsCancellationRequested);
+            return Task.FromResult(Success());
+        };
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            var run = fixture.Run(cancellation.Token);
+            cancellation.Cancel();
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            var shutdown = await fixture.Time.NextTimerAsync(TimeSpan.FromSeconds(25));
+            (await fixture.Time.NextTimerAsync(RenewalInterval)).Fire();
+            var nextInterval = await fixture.Time.NextTimerAsync(RenewalInterval);
+            Assert.Equal(1, fixture.Store.RenewCalls);
+            shutdown.Fire();
+            var result = await Finished(run);
+            Assert.True(result.ShutdownTimedOut);
+            Assert.Equal(InboxCoordinationStatus.Cancelled, result.Status);
+            Assert.False(nextInterval.Active);
+            release.Set();
+            processing.SetException(new OperationCanceledException(fixture.Processor.Token));
+            await result.Quiescence.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.True(result.Quiescence.IsCompletedSuccessfully);
+            Assert.Equal(new[] { "acquire", "renew" }, fixture.Store.Calls);
+            Assert.Equal(0, fixture.Time.ActiveTimerCount);
+        }
+        finally { release.Set(); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProcessorExitDuringShutdownStopsRenewalsAndOnlyObservesLateStoreOutcome(bool lateFault)
+    {
+        var fixture = new Fixture(TimeSpan.FromSeconds(25));
+        var processing = Signal<InboxNotificationProcessingResult>();
+        var renewal = Signal<InboxMutationResult>();
+        var storeCancelled = Signal<bool>();
+        fixture.Processor.Process = _ => processing.Task;
+        fixture.Store.Renew = token =>
+        {
+            token.Register(() => storeCancelled.TrySetResult(true));
+            return renewal.Task;
+        };
+        using var cancellation = new CancellationTokenSource();
+        var run = fixture.Run(cancellation.Token);
+        cancellation.Cancel();
+        var shutdown = await fixture.Time.NextTimerAsync(TimeSpan.FromSeconds(25));
+        (await fixture.Time.NextTimerAsync(RenewalInterval)).Fire();
+        await fixture.Store.RenewEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        processing.SetResult(InboxNotificationProcessingResult.RetryAfter(TimeSpan.Zero));
+        await storeCancelled.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        shutdown.Fire(); // Final observation must reuse the original shutdown budget.
+        var result = await Finished(run);
+        Assert.Equal(InboxCoordinationStatus.Cancelled, result.Status);
+        Assert.True(result.ShutdownTimedOut);
+        Assert.False(result.Quiescence.IsCompleted);
+        if (lateFault) renewal.SetException(new IOException("late renewal fault"));
+        else renewal.SetResult(Success());
+        await result.Quiescence.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(new[] { "acquire", "renew" }, fixture.Store.Calls);
+        Assert.Equal(0, fixture.Time.ActiveTimerCount);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ShutdownDeadlineStopsRenewalWithOrWithoutAnInFlightCall(bool inFlight)
+    {
+        var fixture = new Fixture();
+        var processing = Signal<InboxNotificationProcessingResult>();
+        var renewal = Signal<InboxMutationResult>();
+        CancellationToken storeToken = default;
+        fixture.Processor.Process = _ => processing.Task;
+        fixture.Store.Renew = token => { storeToken = token; return renewal.Task; };
+        using var cancellation = new CancellationTokenSource();
+        var run = fixture.Run(cancellation.Token);
+        var interval = await fixture.Time.NextTimerAsync(RenewalInterval);
+        if (inFlight)
+        {
+            interval.Fire();
+            await fixture.Store.RenewEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        cancellation.Cancel();
+        (await fixture.Time.NextTimerAsync(ShutdownTimeout)).Fire();
+        var result = await Finished(run);
+        Assert.Equal(InboxCoordinationStatus.Cancelled, result.Status);
+        Assert.True(result.ShutdownTimedOut);
+        Assert.True(fixture.Processor.Token.IsCancellationRequested);
+        if (inFlight) Assert.True(storeToken.IsCancellationRequested);
+        Assert.Equal(0, fixture.Time.ActiveTimerCount);
+        renewal.SetResult(Success());
+        processing.SetResult(InboxNotificationProcessingResult.Succeeded);
+        await result.Quiescence.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(inFlight ? new[] { "acquire", "renew" } : new[] { "acquire" }, fixture.Store.Calls);
+    }
+
+    [Theory]
+    [InlineData(0, InboxCoordinationStatus.LeaseLost)]
+    [InlineData(1, InboxCoordinationStatus.OutcomeUnknown)]
+    [InlineData(2, InboxCoordinationStatus.StoreFailed)]
+    [InlineData(3, InboxCoordinationStatus.OutcomeUnknown)]
+    public async Task ShutdownAbandonsRenewalOnLostOrUncertainAuthority(int failure, InboxCoordinationStatus expected)
+    {
+        var fixture = new Fixture(TimeSpan.FromSeconds(25));
+        var processing = Signal<InboxNotificationProcessingResult>();
+        var renewal = Signal<InboxMutationResult>();
+        var storeCancelled = Signal<bool>();
+        fixture.Processor.Process = _ => processing.Task;
+        fixture.Store.Renew = token =>
+        {
+            token.Register(() => storeCancelled.TrySetResult(true));
+            return renewal.Task;
+        };
+        using var cancellation = new CancellationTokenSource();
+        var run = fixture.Run(cancellation.Token);
+        await (await fixture.Time.NextRegisteredTimerAsync(OperationTimeout)).Disposed.WaitAsync(TimeSpan.FromSeconds(10));
+        cancellation.Cancel();
+        var shutdown = await fixture.Time.NextTimerAsync(TimeSpan.FromSeconds(25));
+        (await fixture.Time.NextTimerAsync(RenewalInterval)).Fire();
+        await fixture.Store.RenewEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        if (failure == 3) (await fixture.Time.NextTimerAsync(OperationTimeout)).Fire();
+        else if (failure == 2) renewal.SetException(new IOException("renewal failed"));
+        else renewal.SetResult(new(failure == 0 ? InboxMutationStatus.LeaseLost : InboxMutationStatus.OutcomeUnknown));
+        await storeCancelled.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.False(run.IsCompleted);
+        shutdown.Fire();
+        var result = await Finished(run);
+        Assert.Equal(expected, result.Status);
+        Assert.Equal(InboxCoordinationStage.Renewal, result.Stage);
+        if (failure == 3) Assert.IsType<TimeoutException>(result.Error);
+        if (failure == 2) Assert.IsType<IOException>(result.Error);
+        Assert.True(result.ShutdownTimedOut);
+        if (failure == 3) renewal.SetResult(Success()); // Late confirmation cannot restore authority.
+        processing.SetResult(InboxNotificationProcessingResult.Succeeded);
+        await result.Quiescence.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(new[] { "acquire", "renew" }, fixture.Store.Calls);
+        Assert.Equal(0, fixture.Time.ActiveTimerCount);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public async Task NonCooperativeProcessorHasBoundedShutdownAndLateOutcomeIsOnlyObserved(bool lateFault)
     {
         var fixture = new Fixture();
@@ -480,6 +708,7 @@ public sealed class InboxProcessingCoordinatorTests
         };
         fixture.Store.Renew = _ => renewal.Task;
         var run = fixture.Run();
+        await (await fixture.Time.NextRegisteredTimerAsync(OperationTimeout)).Disposed.WaitAsync(TimeSpan.FromSeconds(10));
         (await fixture.Time.NextTimerAsync(RenewalInterval)).Fire();
         await fixture.Store.RenewEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
         (await fixture.Time.NextTimerAsync(OperationTimeout)).Fire();
@@ -532,6 +761,7 @@ public sealed class InboxProcessingCoordinatorTests
         var completion = Signal<InboxMutationResult>();
         fixture.Store.Complete = _ => completion.Task;
         var run = fixture.Run();
+        await (await fixture.Time.NextRegisteredTimerAsync(OperationTimeout)).Disposed.WaitAsync(TimeSpan.FromSeconds(10));
         await fixture.Store.TerminalEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
         (await fixture.Time.NextTimerAsync(OperationTimeout)).Fire();
         (await fixture.Time.NextTimerAsync(ShutdownTimeout)).Fire();
@@ -567,12 +797,13 @@ public sealed class InboxProcessingCoordinatorTests
     // This real-time bound is a deadlock guard only; it does not order any test events.
     private static Task<InboxCoordinationResult> Finished(Task<InboxCoordinationResult> task) => task.WaitAsync(TimeSpan.FromSeconds(10));
 
-    private sealed class Fixture
+    private sealed class Fixture(TimeSpan? shutdownTimeout = null)
     {
         public ControlledTimeProvider Time { get; } = new();
         public SyntheticStore Store { get; } = new();
         public SyntheticProcessor Processor { get; } = new();
-        public InboxProcessingCoordinator Coordinator => new(Store, Processor, Options, Time);
+        public InboxProcessingCoordinator Coordinator => new(Store, Processor, shutdownTimeout is null
+            ? Options : new(LeaseDuration, RenewalInterval, OperationTimeout, shutdownTimeout.Value), Time);
         public Task<InboxCoordinationResult> Run(CancellationToken token = default) => Coordinator.RunOnceAsync("execution", token);
     }
 
@@ -622,8 +853,10 @@ public sealed class InboxProcessingCoordinatorTests
             Assert.Same(Work.Lease, lease);
             Assert.Equal(LeaseDuration, leaseDuration);
             Calls.Add("renew");
+            var operation = Renew(cancellationToken);
+            // Publish entry only after the delegate has installed its token/callback signals.
             RenewEntered.TrySetResult(true);
-            return Renew(cancellationToken);
+            return operation;
         }
 
         public Task<InboxMutationResult> CompleteAsync(InboxLease lease, CancellationToken cancellationToken)

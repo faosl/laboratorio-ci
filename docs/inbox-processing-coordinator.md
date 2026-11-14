@@ -69,12 +69,25 @@ Tarefas históricas já observadas são removidas do conjunto de acompanhamento 
 - Cancelamento anterior à execução retorna `Cancelled` sem adquirir.
 - Abandono de aquisição em voo retorna `OutcomeUnknown`, sem iniciar processamento caso a
   aquisição venha a confirmar depois.
-- Cancelamento durante processamento retorna `Cancelled`, sem liberar/reagendar a reserva.
+- Cancelamento durante processamento solicita cancelamento cooperativo ao processador e inicia
+  a drenagem da política B, sem liberar/reagendar a reserva. O token do processador é independente
+  do token das chamadas ao store. Enquanto a tarefa do processador estiver pendente, houver
+  autoridade confirmada e restar orçamento, o supervisor continua renovando o lease.
+- A drenagem preserva o intervalo atual e o prazo de uma renovação já em voo. Mantém no máximo
+  uma renovação em andamento e inicia o próximo `RenewalInterval` após a confirmação anterior.
+  Cada chamada respeita `StoreOperationTimeout`; `ShutdownTimeout` pode encerrar a espera antes.
+- Término do processador ou esgotamento do orçamento interrompe novas renovações e retorna
+  `Cancelled`. Perda/incerteza de autoridade, exceção ou timeout de renovação interrompe novas
+  renovações e retorna o resultado correspondente no estágio `Renewal`. Um sucesso tardio não
+  restaura a autoridade nem inicia conclusão/retry após o cancelamento.
 - Cancelamento ou timeout durante finalização retorna `OutcomeUnknown`; uma confirmação de
   sucesso recebida durante a drenagem ainda prevalece.
 
-O encerramento pede cancelamento com `CancelAsync` e espera por todas as chamadas iniciadas e
-callbacks de cancelamento, até `ShutdownTimeout`. Isso também limita a espera por um callback
+O encerramento usa um único orçamento de `ShutdownTimeout`, iniciado quando o supervisor observa
+a solicitação: ele cobre a drenagem com renovações e a observação final, sem reiniciar o prazo.
+Pede cancelamento com `CancelAsync`; o token do store é cancelado ao encerrar a manutenção do
+lease. Espera por todas as chamadas iniciadas e callbacks dentro do orçamento restante.
+Isso também limita a espera por um callback
 que bloqueie. `ShutdownTimedOut` sinaliza que ainda pode haver código em execução; não autoriza
 descarte das dependências que esse código usa nem repetição de efeitos.
 
@@ -82,6 +95,32 @@ descarte das dependências que esse código usa nem repetição de efeitos.
 observadas internamente; não alteram o resultado retornado nem são expostas como novos erros
 nesse snapshot. Não se iniciam outras chamadas ao store após o retorno. Uma confirmação recebida
 depois do prazo de encerramento também não modifica o snapshot.
+
+## Verificação da política B — 2026-11-14
+
+Comandos executados em Release, target `net8.0`, SDK 10.0.101 e runtime .NET 8:
+
+```powershell
+dotnet test Ordering.Application.Tests/Ordering.Application.Tests.csproj -c Release --no-restore
+dotnet test Ordering.API.Tests/Ordering.API.Tests.csproj -c Release --no-restore
+git diff --check
+```
+
+Application: 71 aprovados (12 casos adicionais); API: 38 aprovados, sem falhas ou skips na
+verificação final. Na primeira execução da API, 37 passaram e um falhou pelo bloqueio de escrita
+no log de eventos do Windows pelo sandbox. Os 38 passaram na reexecução autorizada fora dele.
+
+Os casos adicionais verificam renovação durante shutdown, inclusive com renovação previamente
+em voo, tokens independentes, término do processador, orçamento único esgotado, perda/incerteza
+de autoridade, exceção/timeout do store e callbacks de cancelamento bloqueantes ou com falha.
+Resultados e falhas tardias são observados por `Quiescence`, sem novas chamadas após o retorno.
+`ControlledTimeProvider` dispara explicitamente os temporizadores; `TaskCompletionSource`
+sincroniza chamadas e callbacks. A sinalização de descarte dos temporizadores impede confundir
+o prazo já cancelado da aquisição com o prazo de uma operação seguinte. Os 10 segundos de espera
+real servem apenas como guarda contra deadlock.
+
+Esta validação usa doubles; PostgreSQL real, POS real e CI remoto não foram exercitados neste
+ajuste. A execução abaixo é o registro histórico do incremento anterior.
 
 ## Verificação local — 2026-11-13
 
