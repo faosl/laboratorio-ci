@@ -9,6 +9,11 @@ internal sealed class ControlledTimeProvider : TimeProvider
     private readonly object _gate = new();
     private readonly Dictionary<TimeSpan, Channel<ControlledTimer>> _scheduled = [];
     private readonly List<ControlledTimer> _timers = [];
+    private long _timestamp;
+
+    public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+    public override long GetTimestamp() => Interlocked.Read(ref _timestamp);
+    public void Advance(TimeSpan elapsed) => Interlocked.Add(ref _timestamp, elapsed.Ticks);
 
     public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
     {
