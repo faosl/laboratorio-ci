@@ -3,6 +3,9 @@
 A base de coordenação recuperável da Inbox oferece leases persistidos e fencing tokens,
 sem worker executável. Consulte [estados, migração e testes](docs/inbox-processing-leases.md).
 
+A biblioteca `Ordering.Hosting` oferece o `InboxBackgroundService` para composição explícita.
+Consulte [polling, supervisão, configurações e testes](docs/inbox-background-service.md).
+
 ## Adaptador HTTP Uber Eats — somente laboratório
 
 `POST /webhooks/uber-eats/orders` é mapeado apenas no ambiente `Laboratory`.
