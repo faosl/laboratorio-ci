@@ -3,7 +3,7 @@
 ## Composição e arquitetura
 
 `Ordering.Hosting` é uma biblioteca `net8.0`. Ela referencia Application e
-`Microsoft.Extensions.Hosting.Abstractions` 8.0.1 e contém o `InboxBackgroundService`.
+`Microsoft.Extensions.Hosting` 8.0.1 e contém o `InboxBackgroundService`.
 O vínculo com hospedagem fica nessa camada. O coordenador continua responsável pelas
 operações de aquisição, renovação, finalização e retry de cada tentativa.
 
@@ -29,8 +29,8 @@ O descarte de um escopo não deve descartar esse Singleton.
 
 O responsável pela composição transfere a posse do escopo a `InboxWorkerExecution`.
 Se resolver as dependências antes dessa transferência e a resolução falhar, deve
-liberar o escopo. A composição de teste resolve dentro do delegate já protegido pelo
-`await using` do worker, garantindo o descarte também se a resolução lançar exceção.
+liberar o escopo. A composição de teste resolve dentro do delegate já protegido pela
+fronteira de descarte assíncrono do worker, garantindo o descarte também se a resolução lançar exceção.
 
 Para integrar futuramente, construa `InboxWorkerExecution` com o método do coordenador
 e o escopo dedicado, forneça a fábrica ao serviço e registre explicitamente o serviço
@@ -39,8 +39,8 @@ e Tasks. Uma instância do serviço corresponde a uma execução do worker.
 
 A composição isolada em `InboxWorkerScopeTests` usa `IServiceScopeFactory.CreateAsyncScope`,
 `ValidateScopes` e `ValidateOnBuild`. Os testes incluem a rejeição de uma dependência
-Scoped capturada por um Singleton e de resolução Scoped no contêiner raiz. Hosting e
-Npgsql adicionais pertencem exclusivamente ao projeto de testes.
+Scoped capturada por um Singleton e de resolução Scoped no contêiner raiz.
+Npgsql pertence exclusivamente ao projeto de testes de Hosting.
 
 A entrega fornece a biblioteca e testes com doubles. A ativação em Inbox persistente
 depende de um processador de negócio adequado e de composição explícita. Os hosts
@@ -102,10 +102,9 @@ descartado mesmo com `Quiescence` pendente. Não há garantia de que continue v�
 depois desse descarte. Os testes mantêm a raiz viva até a quiescência e usam apenas
 Stores e Processors sintéticos; não validam shutdown seguro com recursos reais.
 
-Uma solução operacional mais ampla poderia coordenar o encerramento e o descarte do
-contêiner raiz com a quiescência de todos os workers, definindo também o tratamento de
-tarefas que nunca terminam e do prazo externo de término do processo. Isso requer
-decisões de arquitetura e hospedagem e permanece fora deste incremento.
+A composição isolada descrita abaixo coordena a quiescência dos workers registrados
+e fornece autorização explícita para descarte normal da raiz. O término definitivo
+de operações que nunca concluem exige política operacional e supervisor externo.
 
 Esse comportamento limita o tempo aguardado pelo host, sob as condições usuais de
 agendamento do runtime e implementações assíncronas que devolvem Tasks prontamente.
@@ -122,7 +121,127 @@ até quiescência pressupõe o cumprimento desse contrato. Os resultados esperad
 coordenador são tratados pelas políticas acima. O comportamento de falha do host depende
 de sua configuração.
 
-## Verificação local em 16/11/2026
+## Coordenação global no Generic Host isolado
+
+`InboxShutdownCoordinator` recebe um `IHost`, o orçamento global de drenagem e um
+`TimeProvider`. Os participantes são as instâncias de `InboxBackgroundService` registradas
+como `IHostedService`, na ordem de registro. Registros vazios ou duplicados são rejeitados.
+O orçamento é obrigatório, finito e de pelo menos 1 ms, dentro do limite dos timers .NET.
+
+A composição deve configurar as opções antes de construir o host.
+
+```csharp
+services.Configure<HostOptions>(options =>
+{
+    options.ServicesStopConcurrently = true;
+    options.ShutdownTimeout = Timeout.InfiniteTimeSpan;
+});
+```
+
+No .NET 8, `ServicesStopConcurrently` permite ao host chamar os `StopAsync` seguintes
+assim que a parte síncrona de cada chamada devolve sua Task. Isso transmite a parada
+a todos os participantes antes da espera integral pela drenagem. O timeout interno
+infinito deixa o orçamento sob controle do relógio fornecido ao coordenador.
+As implementações precisam devolver Tasks prontamente, inclusive callbacks de cancelamento.
+O comportamento foi conferido no [código do Generic Host 8.0.1](https://github.com/dotnet/runtime/blob/v8.0.1/src/libraries/Microsoft.Extensions.Hosting/src/Internal/Host.cs).
+
+Depois de `await host.StartAsync()`, o proprietário explícito do ciclo de vida pode executar
+o trecho seguinte, com orçamento e relógio fornecidos pela composição.
+
+```csharp
+var shutdown = new InboxShutdownCoordinator(host, configuredDrainTimeout, timeProvider);
+var result = await shutdown.ShutdownAsync();
+```
+
+Esse coordenador deve ser o único responsável pela chamada a `Host.StopAsync`.
+Chamadas repetidas e concorrentes a `ShutdownAsync` compartilham a mesma Task e o mesmo
+resultado. O contrato de propriedade exige conduzir o ciclo de vida explicitamente,
+incluindo retenção e descarte do host. `RunAsync`, `WaitForShutdownAsync` e chamadas
+independentes a `StopAsync` assumem responsabilidades de parada ou descarte que conflitam
+com esse proprietário. A composição de aceitação está em `InboxShutdownCoordinatorTests`.
+
+O resultado contém o estado de parada do host, uma indicação de falha dessa parada e
+snapshots dos participantes, identificados pela posição na lista de registros.
+Cada snapshot distingue solicitação de parada, término comprovado das operações,
+conclusão de `ExecuteTask`, descarte dos escopos e falhas de supervisão.
+Os diagnósticos utilizam categorias fixas, sem conteúdo de eventos, conexão ou exceções.
+
+- `Drained` exige parada do host concluída, todos os workers sinalizados, suas operações
+  supervisionadas concluídas, `ExecuteTask` concluídas e escopos descartados com sucesso.
+  `RootDisposalAuthorized` permite então o descarte normal da raiz pelo proprietário.
+  A garantia abrange os participantes registrados e o trabalho declarado pelo contrato
+  de supervisão. Consumidores externos exigem sua própria coordenação.
+- `DeadlineExceeded` indica orçamento global esgotado enquanto a conclusão ainda era
+  aguardada. O mesmo timer abrange operações, quiescência e descarte assíncrono dos escopos.
+  A medição monotônica também detecta conclusão observada depois do orçamento.
+- `Unverified` indica supervisão comprometida. Essa classificação tem precedência quando
+  também há vencimento do prazo. A evidência fica gravada antes de aguardar o descarte,
+  permitindo observar a falha mesmo com `ExecuteTask` pendente ou concluída normalmente.
+
+`InboxBackgroundService.ShutdownState` expõe a evidência corrente. Falhas capturadas ao
+aguardar o resultado/quiescência ficam registradas como `ResultSupervision`. Exceções
+inesperadas da execução continuam propagadas sem retry e recebem a categoria `Execution`.
+Falhas de descarte recebem `ScopeDisposal`. Essas classificações expressam ausência de
+comprovação suficiente. Uma Task faulted, por si só, deixa a existência de trabalho órfão
+indeterminada.
+
+Quando um delegate ou a composição conhece uma operação destacada, deve chamar
+`worker.ReportUntrackedWork()` antes de concluir a execução supervisionada. O marcador
+`KnownUntrackedWork` é permanente. A descoberta genérica dessas operações permanece
+fora das capacidades do runtime.
+
+Em `DeadlineExceeded` e `Unverified`, o proprietário deve manter o host e a raiz vivos.
+O coordenador mantém a chamada original a `Host.StopAsync` e a observação de todas as
+`ExecuteTask`. `shutdown.Completion` permite acompanhar esse término posterior,
+inclusive suas falhas observadas. O snapshot original conserva sua classificação e sua
+autorização. O término posterior exige avaliação explícita das evidências para liberar recursos.
+
+O timeout limita a espera do coordenador. Operações PostgreSQL dependem de seu próprio
+cancelamento e término efetivo. O `NpgsqlDataSource` permanece Singleton de propriedade
+da raiz, cujo descarte é responsabilidade do proprietário do host. A aplicação real
+necessitará de supervisor externo e política operacional explícita para o término
+definitivo em caso de bloqueio ou supervisão comprometida.
+
+As fixtures retêm a raiz, liberam as operações sintéticas e aguardam a chamada original
+de parada antes de descartar explicitamente o host. Esse controle inclui trabalho destacado
+conhecido e descartes suspensos. O incremento permanece restrito à composição isolada.
+
+### Verificação da coordenação global em 16/11/2026
+
+Base conferida antes das alterações em `teste-pr`, HEAD
+`b0829ec1e418803207099f4a629e7e3f4a9876f4`, árvore limpa.
+Compilação local com SDK 10.0.101, target `net8.0` e execução em runtime .NET 8.
+
+- Hosting, 51 testes aprovados, incluindo 12 casos novos de coordenação global.
+- Application, 71 aprovados, incluindo regressões de leases e shutdown.
+- API, 38 aprovados.
+- Domain, 7 aprovados.
+- Contracts.Partners, 16 aprovados.
+- Integrations.UberEats, 120 aprovados.
+
+Total local de 303 aprovados, zero falhas e zero skips nas execuções finais.
+Os comandos utilizaram `dotnet test <projeto>/<projeto>.csproj -c Release`, com
+`--no-restore` após o restore inicial. O restore precisou de execução autorizada para
+leitura de `NuGet.Config`. A suíte API passou após reexecução autorizada para permitir
+o logger do Event Log do Windows, que havia sido bloqueado no sandbox.
+
+Os novos casos utilizam `TaskCompletionSource`, sinais de cancelamento e timers de
+disparo explícito. Limites de tempo real de 10 segundos funcionam como guardas contra
+deadlock. Os testes cobrem três workers em conclusões distintas, sinalização concorrente,
+idempotência da parada, retenção durante quiescência e descarte assíncrono, prazo único,
+falha capturada de quiescência, execução inesperada sem retry, trabalho destacado conhecido,
+falhas de descarte e parada do host, evidência de falha com descarte pendente e validação
+de composição e orçamento. A ausência de novas aquisições é conferida após a parada.
+
+O DataSource real é criado como Singleton da raiz e compartilhado pelos escopos.
+As verificações exercitam a composição e objetos de conexão fechados. Após descarte
+explícito do host, a tentativa de abrir conexão falha por descarte do DataSource antes
+de alcançar a rede. As operações de drenagem são doubles e nenhuma conexão é aberta.
+`INBOX_TEST_CONNECTION` estava ausente, portanto a suíte PostgreSQL permanece pendente
+localmente. A coordenação com PostgreSQL e POS reais e o comportamento do supervisor
+externo ainda exigem validação operacional.
+
+## Verificação do incremento anterior em 16/11/2026
 
 Base conferida antes das alterações: `teste-pr`, HEAD
 `0c90192c76128fa6834a2b905dccd7616314ce44`, árvore de trabalho limpa.

@@ -14,6 +14,20 @@ public sealed class InboxBackgroundService : BackgroundService
     private readonly InboxWorkerOptions _options;
     private readonly TimeProvider _time;
     private readonly ILogger<InboxBackgroundService> _logger;
+    private int _stopRequested;
+    private int _operationsCompleted = 1;
+    private int _scopesDisposed = 1;
+    private int _supervisionFailures;
+
+    public InboxWorkerShutdownState ShutdownState => new(Volatile.Read(ref _stopRequested) != 0,
+        Volatile.Read(ref _operationsCompleted) != 0, ExecuteTask is { IsCompleted: true },
+        Volatile.Read(ref _scopesDisposed) != 0, (InboxSupervisionFailure)Volatile.Read(ref _supervisionFailures));
+
+    /// <summary>Explicit evidence from a delegate/composition aware of work outside Quiescence.
+    /// This is sticky and must be reported before the supervised execution completes.</summary>
+    public void ReportUntrackedWork() => RecordFailure(InboxSupervisionFailure.KnownUntrackedWork);
+
+    private void RecordFailure(InboxSupervisionFailure failure) => Interlocked.Or(ref _supervisionFailures, (int)failure);
 
     public InboxBackgroundService(Func<InboxWorkerExecution> createExecution, InboxWorkerOptions options,
         TimeProvider timeProvider, ILogger<InboxBackgroundService> logger)
@@ -41,8 +55,10 @@ public sealed class InboxBackgroundService : BackgroundService
             {
                 var started = _time.GetTimestamp();
                 InboxCoordinationResult result;
+                Volatile.Write(ref _operationsCompleted, 0);
                 var execution = _createExecution();
-                await using (execution.OwnedDependencies)
+                Volatile.Write(ref _scopesDisposed, 0);
+                try
                 {
                     // Unexpected exceptions propagate to host supervision, without retry. Without
                     // a result's Quiescence, detached tasks from a faulty delegate cannot be tracked.
@@ -64,12 +80,33 @@ public sealed class InboxBackgroundService : BackgroundService
                             // Uncancellable, including when a logger throws. Dispose only this
                             // attempt's dependencies after every supervised task has settled.
                             await result.Quiescence;
+                            Volatile.Write(ref _operationsCompleted, 1);
                         }
                     }
                     catch (Exception error)
                     {
+                        RecordFailure(InboxSupervisionFailure.ResultSupervision);
                         _logger.LogCritical(error, "Inbox owner {Owner} result supervision failed. Acquisitions stopped.", owner);
                         return;
+                    }
+                }
+                catch (Exception)
+                {
+                    // Record before disposal, which can itself remain pending past the deadline.
+                    RecordFailure(InboxSupervisionFailure.Execution);
+                    throw;
+                }
+                finally
+                {
+                    try
+                    {
+                        await execution.OwnedDependencies.DisposeAsync();
+                        Volatile.Write(ref _scopesDisposed, 1);
+                    }
+                    catch (Exception)
+                    {
+                        RecordFailure(InboxSupervisionFailure.ScopeDisposal);
+                        throw;
                     }
                 }
 
@@ -106,11 +143,21 @@ public sealed class InboxBackgroundService : BackgroundService
                     await Task.Delay(delay, _time, stoppingToken);
             }
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            if (Volatile.Read(ref _operationsCompleted) == 0)
+                RecordFailure(InboxSupervisionFailure.Execution);
+        }
+        catch (Exception)
+        {
+            RecordFailure(InboxSupervisionFailure.Execution);
+            throw;
+        }
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
+        Volatile.Write(ref _stopRequested, 1);
         await base.StopAsync(cancellationToken);
         if (ExecuteTask is { IsCompleted: false })
             _logger.LogCritical("Inbox host shutdown deadline elapsed. ExecuteTask still supervises pending work and owns attempt dependencies; root-owned singletons may be disposed by the host.");
