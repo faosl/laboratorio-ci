@@ -3,9 +3,10 @@ using Ordering.Application.Inbox;
 namespace Ordering.Hosting;
 
 /// <summary>
-/// Owns the complete dependency lifetime used by RunOnceAsync, including shared store/processor
-/// resources. The factory must create dedicated resources whose disposal is transferred here.
-/// Container-owned singletons must not be included in this ownership boundary.
+/// Owns the scoped dependency lifetime of one RunOnceAsync attempt through its Quiescence.
+/// The factory must create a fresh asynchronous scope (or dedicated resources) for each attempt
+/// and dispose it if resolution fails. Container-owned singletons stay outside this boundary;
+/// retaining this scope cannot prevent their disposal by the root container during shutdown.
 /// </summary>
 public sealed class InboxWorkerExecution
 {
