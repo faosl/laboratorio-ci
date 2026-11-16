@@ -5,8 +5,8 @@ using Ordering.Application.Inbox;
 namespace Ordering.Hosting;
 
 /// <summary>
-/// Polls sequentially. ExecuteTask retains supervision and dependency ownership after the host's
-/// StopAsync deadline, until all local tasks settle. Process termination ends that supervision.
+/// Polls sequentially with dedicated dependencies per attempt. ExecuteTask retains supervision
+/// after StopAsync's deadline, but cannot retain singletons disposed by the root container.
 /// </summary>
 public sealed class InboxBackgroundService : BackgroundService
 {
@@ -32,8 +32,6 @@ public sealed class InboxBackgroundService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var owner = Guid.NewGuid().ToString("N");
-        var execution = _createExecution();
-        await using var dependencies = execution.OwnedDependencies;
         var storeFailureDelay = TimeSpan.Zero;
         var immediateResults = 0;
 
@@ -42,30 +40,37 @@ public sealed class InboxBackgroundService : BackgroundService
             while (!stoppingToken.IsCancellationRequested)
             {
                 var started = _time.GetTimestamp();
-                var result = await execution.RunOnceAsync(owner, stoppingToken);
-                try
+                InboxCoordinationResult result;
+                var execution = _createExecution();
+                await using (execution.OwnedDependencies)
                 {
+                    // Unexpected exceptions propagate to host supervision, without retry. Without
+                    // a result's Quiescence, detached tasks from a faulty delegate cannot be tracked.
+                    result = await execution.RunOnceAsync(owner, stoppingToken);
                     try
                     {
-                        if (result.ShutdownTimedOut)
-                            _logger.LogWarning("Inbox owner {Owner} exceeded coordinator shutdown at {Stage}. Waiting for quiescence.",
-                                owner, result.Stage);
-                        if (result.Status is InboxCoordinationStatus.StoreFailed or InboxCoordinationStatus.ProcessingFailed
-                            or InboxCoordinationStatus.OutcomeUnknown or InboxCoordinationStatus.Cancelled)
-                            _logger.LogWarning(result.Error, "Inbox owner {Owner} returned {Status} at {Stage}.",
-                                owner, result.Status, result.Stage);
+                        try
+                        {
+                            if (result.ShutdownTimedOut)
+                                _logger.LogWarning("Inbox owner {Owner} exceeded coordinator shutdown at {Stage}. Waiting for quiescence.",
+                                    owner, result.Stage);
+                            if (result.Status is InboxCoordinationStatus.StoreFailed or InboxCoordinationStatus.ProcessingFailed
+                                or InboxCoordinationStatus.OutcomeUnknown or InboxCoordinationStatus.Cancelled)
+                                _logger.LogWarning(result.Error, "Inbox owner {Owner} returned {Status} at {Stage}.",
+                                    owner, result.Status, result.Stage);
+                        }
+                        finally
+                        {
+                            // Uncancellable, including when a logger throws. Dispose only this
+                            // attempt's dependencies after every supervised task has settled.
+                            await result.Quiescence;
+                        }
                     }
-                    finally
+                    catch (Exception error)
                     {
-                        // Uncancellable, including when a logger throws. StopAsync is bounded by
-                        // the host token while this task retains all dependencies until quiescence.
-                        await result.Quiescence;
+                        _logger.LogCritical(error, "Inbox owner {Owner} result supervision failed. Acquisitions stopped.", owner);
+                        return;
                     }
-                }
-                catch (Exception error)
-                {
-                    _logger.LogCritical(error, "Inbox owner {Owner} result supervision failed. Acquisitions stopped.", owner);
-                    return;
                 }
 
                 if (stoppingToken.IsCancellationRequested) break;
@@ -108,7 +113,7 @@ public sealed class InboxBackgroundService : BackgroundService
     {
         await base.StopAsync(cancellationToken);
         if (ExecuteTask is { IsCompleted: false })
-            _logger.LogCritical("Inbox host shutdown deadline elapsed. ExecuteTask still supervises pending work and owns its dependencies.");
+            _logger.LogCritical("Inbox host shutdown deadline elapsed. ExecuteTask still supervises pending work and owns attempt dependencies; root-owned singletons may be disposed by the host.");
     }
 
     private TimeSpan NextStoreFailureDelay(TimeSpan previous) => previous == TimeSpan.Zero

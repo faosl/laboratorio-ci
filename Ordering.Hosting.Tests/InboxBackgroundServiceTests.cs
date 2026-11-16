@@ -26,7 +26,7 @@ public sealed class InboxBackgroundServiceTests
         Assert.True(second.Token.IsCancellationRequested);
         Assert.Equal(2, fixture.Calls);
         Assert.True(worker.ExecuteTask!.IsCompletedSuccessfully);
-        Assert.Equal(1, fixture.Dependencies.Disposals);
+        Assert.Equal(2, fixture.Disposals);
         Assert.Equal(0, fixture.Time.ActiveTimerCount);
     }
 
@@ -106,8 +106,9 @@ public sealed class InboxBackgroundServiceTests
         // The delegate publishes its result without advancing any worker delay.
         await fixture.ResultObserved.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(1, fixture.Calls);
+        Assert.Equal(1, fixture.CreatedExecutions);
         Assert.Equal(0, fixture.Time.ActiveTimerCount);
-        Assert.Equal(0, fixture.Dependencies.Disposals);
+        Assert.Equal(0, fixture.Disposals);
         quiescence.SetResult();
         await Stop(worker, await fixture.NextCall());
         Assert.Equal(shutdownTimedOut, fixture.Log.Entries.Any(entry => entry.Message.Contains("coordinator shutdown")));
@@ -131,7 +132,7 @@ public sealed class InboxBackgroundServiceTests
         await Finish(stop);
         worker.Dispose();
         Assert.False(worker.ExecuteTask!.IsCompleted);
-        Assert.Equal(0, fixture.Dependencies.Disposals);
+        Assert.Equal(0, fixture.Disposals);
 
         // The coordinator can return even after the host deadline. Supervision follows its result.
         call.Result.SetResult(new(InboxCoordinationStatus.Cancelled, InboxCoordinationStage.Processing)
@@ -141,12 +142,12 @@ public sealed class InboxBackgroundServiceTests
         });
         await fixture.ResultObserved.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.False(worker.ExecuteTask.IsCompleted);
-        Assert.Equal(0, fixture.Dependencies.Disposals);
+        Assert.Equal(0, fixture.Disposals);
         if (lateFault) quiescence.SetException(new IOException("late failure"));
         else quiescence.SetResult();
         await Finish(worker.ExecuteTask);
         Assert.Equal(1, fixture.Calls);
-        Assert.Equal(1, fixture.Dependencies.Disposals);
+        Assert.Equal(1, fixture.Disposals);
         Assert.Contains(fixture.Log.Entries, entry => entry.Message.Contains("host shutdown deadline"));
         Assert.Equal(lateFault, fixture.Log.Entries.Any(entry => entry.Error?.Message == "late failure"));
         Assert.Equal(0, fixture.Time.ActiveTimerCount);
@@ -170,11 +171,11 @@ public sealed class InboxBackgroundServiceTests
         deadline.Cancel();
         await Finish(stop);
         Assert.False(worker.ExecuteTask!.IsCompleted);
-        Assert.Equal(0, fixture.Dependencies.Disposals);
+        Assert.Equal(0, fixture.Disposals);
         quiescence.SetResult();
         await Finish(worker.ExecuteTask);
         Assert.Equal(1, fixture.Calls);
-        Assert.Equal(1, fixture.Dependencies.Disposals);
+        Assert.Equal(1, fixture.Disposals);
     }
 
     [Theory]
@@ -222,7 +223,7 @@ public sealed class InboxBackgroundServiceTests
         });
         await Finish(worker.ExecuteTask!);
         Assert.Equal(1, fixture.Calls);
-        Assert.Equal(1, fixture.Dependencies.Disposals);
+        Assert.Equal(1, fixture.Disposals);
         Assert.Contains(fixture.Log.Entries, entry => entry.Error?.Message == "quiescence failure");
     }
 
@@ -241,11 +242,11 @@ public sealed class InboxBackgroundServiceTests
         });
         await Finish(fixture.Log.LoggingFailed.Task);
         Assert.False(worker.ExecuteTask!.IsCompleted);
-        Assert.Equal(0, fixture.Dependencies.Disposals);
+        Assert.Equal(0, fixture.Disposals);
         quiescence.SetResult();
         await Finish(worker.ExecuteTask);
         Assert.Equal(1, fixture.Calls);
-        Assert.Equal(1, fixture.Dependencies.Disposals);
+        Assert.Equal(1, fixture.Disposals);
         Assert.Contains(fixture.Log.Entries, entry => entry.Error?.Message == "logger failure");
     }
 
@@ -278,12 +279,12 @@ public sealed class InboxBackgroundServiceTests
             Interlocked.Increment(ref calls);
             return Task.FromResult(new InboxCoordinationResult(InboxCoordinationStatus.LeaseLost,
                 InboxCoordinationStage.Acquisition));
-        }, fixture.Dependencies), new() { MaximumImmediateResults = 3 }, fixture.Time, fixture.Log);
+        }, fixture.CreateDependencies()), new() { MaximumImmediateResults = 3 }, fixture.Time, fixture.Log);
         await worker.StartAsync(default);
         await fixture.Time.NextTimerAsync(TimeSpan.FromMilliseconds(100));
         Assert.Equal(3, Volatile.Read(ref calls));
         await Finish(worker.StopAsync(default));
-        Assert.Equal(1, fixture.Dependencies.Disposals);
+        Assert.Equal(3, fixture.Disposals);
     }
 
     [Fact]
@@ -380,13 +381,58 @@ public sealed class InboxBackgroundServiceTests
     }
 
     [Fact]
+    public async Task CancellationBeforeStartDoesNotCreateAnAttempt()
+    {
+        var fixture = new Fixture();
+        using var worker = fixture.Create();
+        using var stopping = new CancellationTokenSource();
+        stopping.Cancel();
+        await worker.StartAsync(stopping.Token);
+        await Finish(worker.ExecuteTask!);
+        Assert.Equal(0, fixture.CreatedExecutions);
+        Assert.Equal(0, fixture.Calls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UnexpectedRunOnceExceptionFaultsExecutionWithoutRetry(bool synchronous)
+    {
+        var fixture = new Fixture();
+        var error = new IOException("unexpected delegate failure");
+        var entered = Signal();
+        var failure = new TaskCompletionSource<InboxCoordinationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var attempts = 0;
+        using var worker = new InboxBackgroundService(() =>
+        {
+            attempts++;
+            return new((_, _) =>
+            {
+                entered.SetResult();
+                if (synchronous) throw error;
+                return failure.Task;
+            }, fixture.CreateDependencies());
+        }, new(), fixture.Time, fixture.Log);
+        // BackgroundService.StartAsync propagates a fault if execution already completed.
+        var start = worker.StartAsync(default);
+        await Finish(entered.Task);
+        if (!synchronous) failure.SetException(error);
+        Assert.Same(error, await Assert.ThrowsAsync<IOException>(() => Finish(worker.ExecuteTask!)));
+        if (start.IsFaulted) Assert.Same(error, await Assert.ThrowsAsync<IOException>(() => start));
+        else await start;
+        Assert.Equal(1, attempts);
+        Assert.Equal(1, fixture.Disposals);
+        Assert.Equal(0, fixture.Time.ActiveTimerCount);
+    }
+
+    [Fact]
     public void DisposeBeforeStartDoesNotCreateResources()
     {
         var fixture = new Fixture();
         var worker = fixture.Create();
         worker.Dispose();
         Assert.Equal(0, fixture.CreatedExecutions);
-        Assert.Equal(0, fixture.Dependencies.Disposals);
+        Assert.Equal(0, fixture.Disposals);
     }
 
     [Fact]
@@ -431,18 +477,27 @@ public sealed class InboxBackgroundServiceTests
         public int Calls => Volatile.Read(ref _callCount);
         public int CreatedExecutions { get; private set; }
         public ControlledTimeProvider Time { get; } = new();
-        public Dependencies Dependencies { get; } = new();
+        private readonly ConcurrentQueue<Dependencies> _dependencies = new();
+        public int Disposals => _dependencies.Sum(dependencies => dependencies.Disposals);
+        public Dependencies CreateDependencies()
+        {
+            var dependencies = new Dependencies();
+            _dependencies.Enqueue(dependencies);
+            return dependencies;
+        }
         public TestLogger Log { get; } = new();
         public TaskCompletionSource ResultObserved { get; } = Signal();
         public Task<Call> NextCall() => _calls.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
         public InboxBackgroundService Create(InboxWorkerOptions? options = null) => new(() =>
         {
             CreatedExecutions++;
-            return new(RunOnce, Dependencies);
+            return new(RunOnce, CreateDependencies());
         }, options ?? new(), Time, Log);
 
         private async Task<InboxCoordinationResult> RunOnce(string owner, CancellationToken token)
         {
+            // Every status policy must release the previous attempt before acquiring again.
+            Assert.Equal(CreatedExecutions - 1, Disposals);
             var call = new Call(Interlocked.Increment(ref _callCount), owner, token);
             _calls.Writer.TryWrite(call);
             var result = await call.Result.Task;
@@ -457,7 +512,7 @@ public sealed class InboxBackgroundServiceTests
         public int Disposals => Volatile.Read(ref _disposals);
         public ValueTask DisposeAsync()
         {
-            Interlocked.Increment(ref _disposals);
+            Assert.Equal(1, Interlocked.Increment(ref _disposals));
             return ValueTask.CompletedTask;
         }
     }
