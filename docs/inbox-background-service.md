@@ -42,7 +42,8 @@ A composição isolada em `InboxWorkerScopeTests` usa `IServiceScopeFactory.Crea
 Scoped capturada por um Singleton e de resolução Scoped no contêiner raiz.
 Npgsql pertence exclusivamente ao projeto de testes de Hosting.
 
-A entrega fornece a biblioteca e testes com doubles. A ativação em Inbox persistente
+A entrega fornece a biblioteca, testes com doubles e um cenário isolado de shutdown
+com Store PostgreSQL real, descrito abaixo. A ativação em Inbox persistente
 depende de um processador de negócio adequado e de composição explícita. Os hosts
 existentes continuam oferecendo os fluxos já registrados. Os processadores sintéticos
 dos testes ficam no projeto de testes.
@@ -99,8 +100,9 @@ pelo lifetime pode acompanhar a supervisão pela propriedade pública `ExecuteTa
 **Limite do contêiner raiz:** reter um escopo não impede que o host descarte o contêiner
 raiz depois de esgotar o prazo de shutdown. O `NpgsqlDataSource` Singleton poderá ser
 descartado mesmo com `Quiescence` pendente. Não há garantia de que continue válido
-depois desse descarte. Os testes mantêm a raiz viva até a quiescência e usam apenas
-Stores e Processors sintéticos; não validam shutdown seguro com recursos reais.
+depois desse descarte. Os testes mantêm a raiz viva até a quiescência. O cenário
+PostgreSQL abaixo exercita um Store real com Processor sintético; não valida uso
+seguro de recursos após descarte da raiz.
 
 A composição isolada descrita abaixo coordena a quiescência dos workers registrados
 e fornece autorização explícita para descarte normal da raiz. O término definitivo
@@ -205,6 +207,50 @@ definitivo em caso de bloqueio ou supervisão comprometida.
 As fixtures retêm a raiz, liberam as operações sintéticas e aguardam a chamada original
 de parada antes de descartar explicitamente o host. Esse controle inclui trabalho destacado
 conhecido e descartes suspensos. O incremento permanece restrito à composição isolada.
+
+### Shutdown com operação PostgreSQL real em 17/11/2026
+
+`PostgresInboxShutdownTests` reutiliza `DatabaseFixture`, com banco isolado, e o
+`ControlledTimeProvider` compartilhado pelos testes de Application e Hosting.
+Um Generic Host validado possui um único worker, coordenador e Store por escopo,
+Processor sintético e seu próprio `NpgsqlDataSource` Singleton criado pela raiz.
+A fixture mantém um pool independente para bloqueio e observação.
+
+Após aquisição confirmada e início do Processor, uma transação auxiliar bloqueia
+a linha com `SELECT ... FOR UPDATE`. O timer controlado inicia `RenewAsync` real.
+O hook interno `BeforeLock` identifica o PID e ajusta apenas nessa composição os
+limites locais de lock/statement para 8/9 segundos. A observação exige sessão ativa,
+`wait_event_type = 'Lock'`, consulta `FOR UPDATE` e PID da transação auxiliar em
+`pg_blocking_pids`. Uma Task pendente isoladamente não satisfaz essa verificação.
+
+O shutdown é solicitado por `InboxShutdownCoordinator`. O Processor recebe
+cancelamento e permanece retido por sinal. O teste dispara os prazos local e global,
+verifica `ShutdownTimedOut`, `Quiescence` pendente e snapshot `DeadlineExceeded`,
+sem autorização de descarte da raiz. O escopo permanece vivo, a raiz ainda executa
+SQL real e não há nova aquisição. Cancelar Npgsql pode encerrar a renovação antes
+da liberação manual do lock; não se exige espera de lock após o cancelamento.
+
+Depois de liberar a transação e o Processor, o teste aguarda `Completion` e
+`Quiescence`, confere descarte dos recursos Scoped, conclusão do worker e ausência
+de falhas de supervisão. O snapshot original permanece `DeadlineExceeded`, mesmo
+com conclusão posterior. O estado persistido continua `Processing`, com geração 1
+e owner preenchido; não há chamada de conclusão/retry após cancelamento. Isso não
+afirma rollback de uma renovação nem preservação do valor anterior de expiração.
+O descarte explícito final invalida apenas o DataSource da raiz; a fixture ainda
+executa SQL. Bloqueio e sinais sintéticos são liberados em `finally`.
+
+O cenário cobre um worker e uma renovação bloqueada, com limites .NET controlados
+e guardas reais contra deadlock. POS, Outbox, Kafka, ativação operacional, supervisor
+externo e segurança de operações após descarte prematuro da raiz permanecem fora
+desta evidência. As políticas de produção e de publicação não foram alteradas.
+
+Verificação local em Release, target/runtime .NET 8 e SDK 10.0.101: PostgreSQL 17.7,
+77 testes aprovados; Hosting, 51; Application, 71. Total: 199, sem falhas ou skips
+nas execuções finais. Comandos: `dotnet test <projeto>/<projeto>.csproj -c Release
+--no-restore`, com `INBOX_TEST_CONNECTION` apontando para PostgreSQL descartável.
+Na primeira execução completa, um teste HTTP existente falhou por acesso bloqueado
+ao Event Log do Windows; a suíte PostgreSQL inteira passou na reexecução autorizada
+fora do sandbox. O teste novo também passou isoladamente. `git diff --check` passou.
 
 ### Verificação da coordenação global em 16/11/2026
 

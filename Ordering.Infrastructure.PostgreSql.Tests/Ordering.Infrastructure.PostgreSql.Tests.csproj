@@ -16,6 +16,8 @@
     </PackageReference>
     <Using Include="Xunit" />
     <ProjectReference Include="../Ordering.Infrastructure.PostgreSql/Ordering.Infrastructure.PostgreSql.csproj" />
+    <ProjectReference Include="../Ordering.Hosting/Ordering.Hosting.csproj" />
+    <Compile Include="../Ordering.Application.Tests/ControlledTimeProvider.cs" Link="ControlledTimeProvider.cs" />
     <ProjectReference Include="../Ordering.API.LaboratoryHost/Ordering.API.LaboratoryHost.csproj" />
     <ProjectReference Include="../Ordering.Inbox.TestHost/Ordering.Inbox.TestHost.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
