@@ -242,7 +242,7 @@ public sealed class PostgresOrderConfirmationTests(DatabaseFixture database) : I
         await Store.ConfirmAsync(orderId, Token);
         var before = Assert.Single(await ReadMessagesAsync(orderId));
         await using var history = database.Source.CreateCommand("SELECT array_agg(version ORDER BY version) FROM public.ordering_inbox_schema_version");
-        Assert.Equal(new[] { 1, 2, 3 }, (int[])(await history.ExecuteScalarAsync())!);
+        Assert.Equal(new[] { 1, 2, 3, 4 }, (int[])(await history.ExecuteScalarAsync())!);
         await using var applied = database.Source.CreateCommand("SELECT applied_at_utc FROM public.ordering_inbox_schema_version WHERE version = 3");
         var appliedAt = await applied.ExecuteScalarAsync();
 
@@ -250,7 +250,7 @@ public sealed class PostgresOrderConfirmationTests(DatabaseFixture database) : I
         await InboxSchema.ApplyAsync(database.Source);
 
         Assert.Equal(appliedAt, await applied.ExecuteScalarAsync());
-        Assert.Equal(new[] { 1, 2, 3 }, (int[])(await history.ExecuteScalarAsync())!);
+        Assert.Equal(new[] { 1, 2, 3, 4 }, (int[])(await history.ExecuteScalarAsync())!);
         Assert.Equal("Confirmed", await ReadStatusAsync(orderId));
         Assert.Equal(before, Assert.Single(await ReadMessagesAsync(orderId)));
     }
@@ -317,7 +317,7 @@ public sealed class PostgresOrderConfirmationTests(DatabaseFixture database) : I
             Assert.Equal(OrderConfirmationStatus.Confirmed,
                 (await new PostgresOrderConfirmationStore(source).ConfirmAsync("new-order", Token)).Status);
             await using var check = source.CreateCommand("""
-                SELECT (SELECT array_agg(version ORDER BY version) FROM public.ordering_inbox_schema_version) = ARRAY[1, 2, 3]
+                SELECT (SELECT array_agg(version ORDER BY version) FROM public.ordering_inbox_schema_version) = ARRAY[1, 2, 3, 4]
                     AND (SELECT count(*) FROM public.ordering_outbox_messages WHERE aggregate_id = 'new-order') = 1
                 """);
             Assert.Equal(true, await check.ExecuteScalarAsync());

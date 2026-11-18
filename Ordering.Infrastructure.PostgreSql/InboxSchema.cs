@@ -19,7 +19,8 @@ public static class InboxSchema
         // Applied scripts are immutable; pending versions run in order under the same migration lock.
         foreach (var (number, name) in new[]
         {
-            (1, "001_inbox.sql"), (2, "002_inbox_processing.sql"), (3, "003_outbox_lab.sql")
+            (1, "001_inbox.sql"), (2, "002_inbox_processing.sql"), (3, "003_outbox_lab.sql"),
+            (4, "004_outbox_processing.sql")
         })
         {
             await using var version = new NpgsqlCommand(

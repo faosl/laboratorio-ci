@@ -10,6 +10,9 @@ O laboratório de Transactional Outbox confirma o pedido e persiste `OrderConfir
 mesma transação PostgreSQL. Consulte [modelo, resultados e testes de atomicidade local](docs/outbox-atomic-persistence.md).
 Este incremento não entrega eventos ao Kafka nem comprova comportamento exatamente uma vez.
 
+A coordenação persistente da Outbox oferece aquisição concorrente, renovação, recuperação,
+fencing, conclusão local e retry. Consulte [contrato, invariantes e testes do incremento 2](docs/outbox-processing-leases.md).
+
 ## Adaptador HTTP Uber Eats — somente laboratório
 
 `POST /webhooks/uber-eats/orders` é mapeado apenas no ambiente `Laboratory`.
