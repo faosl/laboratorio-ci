@@ -17,7 +17,10 @@ public static class InboxSchema
             """, connection, transaction);
         await setup.ExecuteNonQueryAsync(cancellationToken);
         // Applied scripts are immutable; pending versions run in order under the same migration lock.
-        foreach (var (number, name) in new[] { (1, "001_inbox.sql"), (2, "002_inbox_processing.sql") })
+        foreach (var (number, name) in new[]
+        {
+            (1, "001_inbox.sql"), (2, "002_inbox_processing.sql"), (3, "003_outbox_lab.sql")
+        })
         {
             await using var version = new NpgsqlCommand(
                 "SELECT EXISTS (SELECT 1 FROM public.ordering_inbox_schema_version WHERE version = $1)", connection, transaction);

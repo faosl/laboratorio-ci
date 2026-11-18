@@ -6,6 +6,10 @@ sem worker executável. Consulte [estados, migração e testes](docs/inbox-proce
 A biblioteca `Ordering.Hosting` oferece o `InboxBackgroundService` para composição explícita.
 Consulte [polling, supervisão, configurações e testes](docs/inbox-background-service.md).
 
+O laboratório de Transactional Outbox confirma o pedido e persiste `OrderConfirmed` na
+mesma transação PostgreSQL. Consulte [modelo, resultados e testes de atomicidade local](docs/outbox-atomic-persistence.md).
+Este incremento não entrega eventos ao Kafka nem comprova comportamento exatamente uma vez.
+
 ## Adaptador HTTP Uber Eats — somente laboratório
 
 `POST /webhooks/uber-eats/orders` é mapeado apenas no ambiente `Laboratory`.
