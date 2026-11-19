@@ -8,7 +8,9 @@ Consulte [polling, supervisão, configurações e testes](docs/inbox-background-
 
 O laboratório de Transactional Outbox confirma o pedido e persiste `OrderConfirmed` na
 mesma transação PostgreSQL. Consulte [modelo, resultados e testes de atomicidade local](docs/outbox-atomic-persistence.md).
-Este incremento não entrega eventos ao Kafka nem comprova comportamento exatamente uma vez.
+O Relay explícito publica `OrderConfirmed` em Kafka real e registra a confirmação na Outbox.
+Consulte [configuração, falhas, testes e limites do incremento 3](docs/outbox-kafka-relay.md).
+Não há processamento automático da Outbox na API nem garantia exatamente uma vez.
 
 A coordenação persistente da Outbox oferece aquisição concorrente, renovação, recuperação,
 fencing, conclusão local e retry. Consulte [contrato, invariantes e testes do incremento 2](docs/outbox-processing-leases.md).
