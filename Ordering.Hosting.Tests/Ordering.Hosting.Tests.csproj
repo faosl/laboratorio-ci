@@ -19,6 +19,7 @@
   <ItemGroup>
     <Using Include="Xunit" />
     <ProjectReference Include="../Ordering.Hosting/Ordering.Hosting.csproj" />
+    <ProjectReference Include="../Ordering.Infrastructure.Kafka/Ordering.Infrastructure.Kafka.csproj" />
     <Compile Include="../Ordering.Application.Tests/ControlledTimeProvider.cs" Link="ControlledTimeProvider.cs" />
   </ItemGroup>
 </Project>

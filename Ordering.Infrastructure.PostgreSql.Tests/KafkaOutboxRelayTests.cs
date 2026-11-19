@@ -18,7 +18,7 @@ public sealed class KafkaFixture : IAsyncLifetime
     public Task DisposeAsync() => _broker.DisposeAsync().AsTask();
 }
 
-public sealed class KafkaOutboxRelayTests(DatabaseFixture database, KafkaFixture kafka, ITestOutputHelper output)
+public sealed partial class KafkaOutboxRelayTests(DatabaseFixture database, KafkaFixture kafka, ITestOutputHelper output)
     : IClassFixture<DatabaseFixture>, IClassFixture<KafkaFixture>, IAsyncLifetime
 {
     private readonly string _topic = "order-confirmed-" + Guid.NewGuid().ToString("N");

@@ -11,6 +11,8 @@ mesma transação PostgreSQL. Consulte [modelo, resultados e testes de atomicida
 O Relay explícito publica `OrderConfirmed` em Kafka real e registra a confirmação na Outbox.
 Consulte [configuração, falhas, testes e limites do incremento 3](docs/outbox-kafka-relay.md).
 Não há processamento automático da Outbox na API nem garantia exatamente uma vez.
+O `OutboxBackgroundService` permite publicação automática em Generic Host isolado de laboratório.
+Consulte [composição explícita, polling, recuperação e shutdown supervisionado](docs/outbox-background-service.md).
 
 A coordenação persistente da Outbox oferece aquisição concorrente, renovação, recuperação,
 fencing, conclusão local e retry. Consulte [contrato, invariantes e testes do incremento 2](docs/outbox-processing-leases.md).
