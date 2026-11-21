@@ -1,5 +1,8 @@
 # Ordering.API — laboratório local
 
+O benchmark opcional de aquisição da Outbox usa PostgreSQL descartável e a implementação real.
+Consulte [comandos, protocolo e limites das medições](docs/outbox-acquisition-benchmark.md).
+
 A base de coordenação recuperável da Inbox oferece leases persistidos e fencing tokens,
 sem worker executável. Consulte [estados, migração e testes](docs/inbox-processing-leases.md).
 

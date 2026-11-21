@@ -9,5 +9,6 @@
     <PackageReference Include="Npgsql" Version="8.0.8" />
     <EmbeddedResource Include="Migrations/*.sql" />
     <InternalsVisibleTo Include="Ordering.Infrastructure.PostgreSql.Tests" />
+    <InternalsVisibleTo Include="Ordering.Outbox.Benchmarks" />
   </ItemGroup>
 </Project>
