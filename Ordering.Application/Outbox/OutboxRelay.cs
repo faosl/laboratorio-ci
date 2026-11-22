@@ -50,6 +50,7 @@ public sealed class OutboxRelay
 
     public async Task<OutboxRelayResult> RunOnceAsync(string owner, CancellationToken cancellationToken = default)
     {
+        using var attempt = OutboxRelayDiagnostics.StartAttempt();
         OutboxProcessingLimits.ValidateOwner(owner);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(_options.ExecutionTimeout);
@@ -57,17 +58,24 @@ public sealed class OutboxRelay
         var stage = OutboxRelayStage.Acquisition;
         AcquiredOutboxMessage? work = null;
         var publication = new OutboxPublicationResult(OutboxDeliveryStatus.NotAttempted);
-        OutboxRelayResult Result(OutboxRelayStatus status) => new(status, stage, work?.Content.EventId,
-            publication.Status, publication.Receipt, publication.ErrorCode);
+        OutboxRelayResult Result(OutboxRelayStatus status)
+        {
+            var result = new OutboxRelayResult(status, stage, work?.Content.EventId,
+                publication.Status, publication.Receipt, publication.ErrorCode);
+            attempt.Complete(result);
+            return result;
+        }
         try
         {
             ct.ThrowIfCancellationRequested();
-            var acquisition = await _store.TryAcquireAsync(owner, _options.LeaseDuration, ct);
+            var acquisition = await OutboxRelayDiagnostics.ObserveAsync(stage,
+                () => _store.TryAcquireAsync(owner, _options.LeaseDuration, ct), result => result.Status.ToString(), ct);
             if (acquisition.Status == OutboxAcquisitionStatus.NoEligibleWork)
                 return Result(OutboxRelayStatus.NoEligibleWork);
             if (acquisition.Status == OutboxAcquisitionStatus.OutcomeUnknown)
                 return Result(OutboxRelayStatus.AcquisitionUnknown);
             work = acquisition.Work ?? throw new InvalidOperationException("Confirmed acquisition requires work.");
+            attempt.Acquired(work);
             stage = OutboxRelayStage.Validation;
             if (work.Content.EventType != nameof(OrderConfirmed))
                 return Result(OutboxRelayStatus.UnsupportedEvent);
@@ -78,7 +86,8 @@ public sealed class OutboxRelay
             // Ambiguous delivery outcome: a timeout/error can still leave a record in Kafka.
             // Retrying later preserves EventId, but can duplicate the external effect.
             publication = new(OutboxDeliveryStatus.Unconfirmed);
-            publication = await _publisher.PublishAsync(work.Content, ct);
+            publication = await OutboxRelayDiagnostics.ObserveAsync(stage,
+                () => _publisher.PublishAsync(work.Content, ct), OutboxRelayDiagnostics.PublicationStatus, ct, work);
             ct.ThrowIfCancellationRequested();
             if (publication.Status == OutboxDeliveryStatus.Acknowledged)
             {
@@ -87,7 +96,8 @@ public sealed class OutboxRelay
                 stage = OutboxRelayStage.Completion;
                 // Fencing token validation remains atomic in PostgreSQL. It cannot cancel a
                 // Kafka record already sent, even if this generation has lost its authority.
-                var completion = await _store.MarkPublishedAsync(work.Lease, ct);
+                var completion = await OutboxRelayDiagnostics.ObserveAsync(stage,
+                    () => _store.MarkPublishedAsync(work.Lease, ct), result => result.Status.ToString(), ct, work);
                 return Result(completion.Status switch
                 {
                     OutboxMutationStatus.Succeeded => OutboxRelayStatus.Published,
@@ -99,7 +109,8 @@ public sealed class OutboxRelay
             stage = OutboxRelayStage.Retry;
             // Lease-based recovery: the store alone validates current authority. Unknown
             // completion never reaches this path; it is not evidence of a rollback.
-            var retry = await _store.ScheduleRetryAsync(work.Lease, _options.RetryDelay, ct);
+            var retry = await OutboxRelayDiagnostics.ObserveAsync(stage,
+                () => _store.ScheduleRetryAsync(work.Lease, _options.RetryDelay, ct), result => result.Status.ToString(), ct, work);
             return Result(retry.Status switch
             {
                 OutboxMutationStatus.Succeeded => OutboxRelayStatus.RetryScheduled,

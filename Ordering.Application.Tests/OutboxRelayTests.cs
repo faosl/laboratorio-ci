@@ -2,7 +2,7 @@ using Ordering.Application.Outbox;
 
 namespace Ordering.Application.Tests;
 
-public sealed class OutboxRelayTests
+public sealed partial class OutboxRelayTests
 {
     private sealed class Store : IOutboxProcessingStore
     {
@@ -12,6 +12,8 @@ public sealed class OutboxRelayTests
         public OutboxAcquisitionStatus Acquisition { get; set; } = OutboxAcquisitionStatus.Acquired;
         public OutboxMutationStatus Mutation { get; set; } = OutboxMutationStatus.Succeeded;
         public Exception? Failure { get; set; }
+        public Exception? MutationFailure { get; set; }
+        public Action? DuringMutation { get; set; }
         public List<string> Calls { get; } = [];
         public OutboxLease? UsedLease { get; private set; }
         public Task<OutboxAcquisitionResult> TryAcquireAsync(string owner, TimeSpan duration, CancellationToken ct)
@@ -27,6 +29,8 @@ public sealed class OutboxRelayTests
         {
             Calls.Add(call);
             UsedLease = lease;
+            DuringMutation?.Invoke();
+            if (MutationFailure is not null) throw MutationFailure;
             return Task.FromResult(new OutboxMutationResult(Mutation));
         }
         public Task<OutboxMutationResult> RenewAsync(OutboxLease lease, TimeSpan duration, CancellationToken ct) =>
@@ -39,13 +43,16 @@ public sealed class OutboxRelayTests
         public OutboxPublicationResult Result { get; set; } = new(OutboxDeliveryStatus.Acknowledged, new("orders", 0, 3));
         public int Calls { get; private set; }
         public Action? DuringSend { get; set; }
+        public Exception? Failure { get; set; }
         public OutboxMessage? Sent { get; private set; }
+        public Task<OutboxPublicationResult>? PendingSend { get; set; }
         public Task<OutboxPublicationResult> PublishAsync(OutboxMessage message, CancellationToken ct)
         {
             Calls++;
             Sent = message;
             DuringSend?.Invoke();
-            return Task.FromResult(Result);
+            if (Failure is not null) throw Failure;
+            return PendingSend ?? Task.FromResult(Result);
         }
     }
 
