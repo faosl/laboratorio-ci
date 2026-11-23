@@ -1,5 +1,9 @@
 # Ordering.API — laboratório local
 
+O benchmark opcional fim a fim mede publicação real PostgreSQL → Kafka → PostgreSQL,
+com verificação independente e experimento de recuperação separado.
+Consulte [execução, relatórios e cleanup](docs/outbox-publication-benchmark.md).
+
 O benchmark opcional de aquisição da Outbox usa PostgreSQL descartável e a implementação real.
 Consulte [comandos, protocolo e limites das medições](docs/outbox-acquisition-benchmark.md).
 

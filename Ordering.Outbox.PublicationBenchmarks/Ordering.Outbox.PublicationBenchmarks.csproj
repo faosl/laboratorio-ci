@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Testcontainers.Kafka" Version="4.8.1" />
+    <ProjectReference Include="../Ordering.Infrastructure.PostgreSql/Ordering.Infrastructure.PostgreSql.csproj" />
+    <ProjectReference Include="../Ordering.Infrastructure.Kafka/Ordering.Infrastructure.Kafka.csproj" />
+    <InternalsVisibleTo Include="Ordering.Outbox.PublicationBenchmarks.Tests" />
+  </ItemGroup>
+</Project>
