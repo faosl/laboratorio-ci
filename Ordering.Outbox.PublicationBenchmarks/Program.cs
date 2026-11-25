@@ -17,11 +17,13 @@ if (args.Contains("--help"))
         Opt-in real publication laboratory (.NET 8). Run from the source checkout.
         Requires Docker and INBOX_TEST_CONNECTION pointing ONLY to laboratory PostgreSQL with CREATEDB.
         --smoke                      defaults: 20 events, 1 round (normal: 500 events, 3 rounds)
+        --scalability                opt-in matrix: 1 Shared; 2,4,8 Shared and PerWorker
+        --workers 1,2,4,8             requires scalability; smoke defaults to 1,2 (3 configurations)
         --events N --rounds N --warmups N --warmup-events N
         --batch-timeout-seconds N     default 300; stop on first non-success, no benchmark retries
         --verification-timeout-seconds N  default 30
         --output new-file.json        default: unique file under artifacts/
-        Always includes separate warm-up and injected-failure recovery phases; one sequential worker.
+        Separate warm-up per configuration; final recovery always sequential. Default: one sequential worker.
         See docs/outbox-publication-benchmark.md. No sustained-capacity or exactly-once claim.
         """);
     return 0;
@@ -34,12 +36,14 @@ var report = new Dictionary<string, object?>
     ["Phases"] = phases, ["KafkaCleanup"] = "NotCreated",
     ["Protocol"] = new
     {
-        Workers = 1, Partitions = 1, ReplicationFactor = 1, MinInSyncReplicas = 1,
+        Partitions = 1, ReplicationFactor = 1, MinInSyncReplicas = 1,
         PublisherOptions = "Unmodified defaults: acks=all, idempotence enabled, delivery timeout 30s",
         RelayOptions = "Unmodified defaults: lease 60s, execution timeout 40s, safety margin 10s, retry delay 5s",
         Reset = "Fresh random database, migrated schema, new confirmed orders and exclusive topic for EVERY phase",
-        Measurement = "Monotonic finite-batch wall time: immediately before first relay attempt through last result; preparation and verification excluded",
-        Stages = "Existing MeterListener histograms: publication, completion, relay attempt (seconds converted to milliseconds); no acquisition histogram exists",
+        Measurement = "Monotonic finite-batch wall time: start barrier release through all worker completions; preparation and verification excluded",
+        Stages = "Activity outbox.acquire duration; existing publication, completion, relay attempt histograms; identical correlation/instrumentation across configurations",
+        Warmup = "Separate phase per configuration; fresh producers in measured phases can still pay Kafka session cold-start cost; no slow samples removed",
+        Topology = "Shared preserves existing SemaphoreSlim; PerWorker changes gate sharing AND producer sessions, so differences do not isolate semaphore cost",
         Percentiles = "Nearest-rank from observed samples, independently per instrument; never sum stage percentiles",
         Limitations = "Single replica does not validate HA; finite batches do not measure sustained production capacity",
         Recovery = "Injected exception before PostgreSQL completion, manual expiry in owned database, fresh producer; not a real process crash; duplicates are possible",
@@ -62,6 +66,7 @@ try
     // Retain the CreateNew handle for the whole execution, including error and cleanup reporting.
     outputFile = new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
     report["Options"] = options;
+    report["ConfigurationOrder"] = options.Configurations;
     report["Code"] = await CodeIdentityAsync();
     report["Client"] = new
     {
@@ -85,26 +90,30 @@ try
     if (version.ExitCode != 0) throw new InvalidOperationException("Kafka version unavailable.");
     report["KafkaVersion"] = Regex.Match(version.Stdout, @"\b\d+\.\d+\.\d+[\w.-]*").Value;
     var bootstrap = broker.GetBootstrapAddress();
-    for (var i = 1; i <= options.Warmups; i++)
-        if (!await RunAsync("warmup", i, options.WarmupEvents)) throw new InvalidOperationException("Warm-up incomplete.");
-    for (var i = 1; i <= options.Rounds; i++)
-        if (!await RunAsync("benchmark", i, options.Events)) throw new InvalidOperationException("Round incomplete.");
-    if (!await RunAsync("recovery", 1, 1)) throw new InvalidOperationException("Recovery incomplete.");
+    foreach (var configuration in options.Configurations)
+    {
+        for (var i = 1; i <= options.Warmups; i++)
+            if (!await RunAsync("warmup", i, options.WarmupEvents, configuration)) throw new InvalidOperationException("Warm-up incomplete.");
+        for (var i = 1; i <= options.Rounds; i++)
+            if (!await RunAsync("benchmark", i, options.Events, configuration)) throw new InvalidOperationException("Round incomplete.");
+    }
+    if (!await RunAsync("recovery", 1, 1, new(1, PublisherTopology.Shared))) throw new InvalidOperationException("Recovery incomplete.");
     report["Status"] = "Completed";
     report["BaselineValid"] = true;
     exitCode = 0;
 
-    async Task<bool> RunAsync(string kind, int round, int events)
+    async Task<bool> RunAsync(string kind, int round, int events, WorkerConfiguration configuration)
     {
-        var phase = new PhaseReport(kind, round, events, "outbox-publication-" + Guid.NewGuid().ToString("N"));
+        var phase = new PhaseReport(kind, round, events, "outbox-publication-" + Guid.NewGuid().ToString("N"))
+            { Configuration = configuration, ExecutionOrder = phases.Count + 1 };
         phases.Add(phase);
         await SaveAsync();
-        Console.WriteLine($"{kind} {round}: {events} events; exclusive database and topic.");
+        Console.WriteLine($"{configuration.Id} {kind} {round}: {events} events; exclusive database and topic.");
         await PhaseRunner.RunAsync(phase, bootstrap, options, SaveAsync, cancellation.Token);
         await SaveAsync();
         Console.WriteLine($"{kind} {round}: complete={phase.Complete}; ACKs={phase.Validation?.KafkaAcks}; "
             + $"Kafka records={phase.Validation?.KafkaRecords}; distinct Published={phase.Validation?.PublishedDistinctIds}.");
-        return phase.Complete && phase.DatabaseCleanup == "Dropped";
+        return phase.Complete && phase.DatabaseCleanup == "Dropped" && phase.PublisherCleanup == "Disposed";
     }
 }
 catch (Exception error)
@@ -128,6 +137,7 @@ finally
         exitCode = 1;
     }
     report["FinishedAtUtc"] = DateTimeOffset.UtcNow;
+    report["ScalingSummary"] = ScalingSummary.Create(phases, report["BaselineValid"] is true);
     var measured = phases.Where(p => p.Kind == "benchmark").ToArray();
     report["MeasuredTotals"] = new
     {

@@ -1,12 +1,14 @@
 # Benchmark fim a fim da publicação Outbox
 
-Ferramenta opt-in .NET 8: `Ordering.Outbox.PublicationBenchmarks`. Não integra a CI,
-o startup HTTP nem os workers operacionais. Não modifica SQL, migrações, contratos,
+Ferramenta opt-in .NET 8: `Ordering.Outbox.PublicationBenchmarks`. O experimento
+pesado não integra a CI, o startup HTTP nem os workers operacionais. Seus testes
+rápidos são executados na CI, sem depender de serviços. Não modifica SQL, migrações, contratos,
 ACKs, retries, idempotência, leases, fencing, pool ou cancelamento da implementação.
 
 Executa o fluxo real por `OutboxRelay.RunOnceAsync`, com
 `PostgresOutboxProcessingStore` e `KafkaOutboxEventPublisher`. Não há doubles de
-publicação no benchmark normal. Um worker chama o relay sequencialmente.
+publicação no benchmark normal. O modo padrão mantém um worker sequencial.
+`--scalability` habilita a matriz concorrente do incremento 8.
 
 ## Execução PowerShell
 
@@ -41,10 +43,10 @@ try {
     dotnet test Ordering.Outbox.PublicationBenchmarks.Tests -c Release
     if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed' }
     dotnet run --project Ordering.Outbox.PublicationBenchmarks -c Release -- `
-        --smoke --output artifacts/publication-smoke.json
+        --scalability --smoke --output artifacts/publication-scalability-smoke.json
     if ($LASTEXITCODE -ne 0) { throw 'Smoke incomplete; inspect its JSON' }
     dotnet run --project Ordering.Outbox.PublicationBenchmarks -c Release --no-build -- `
-        --output artifacts/publication-benchmark.json
+        --scalability --output artifacts/publication-scalability.json
     if ($LASTEXITCODE -ne 0) { throw 'Benchmark incomplete; inspect its JSON' }
 } finally {
     $env:INBOX_TEST_CONNECTION = $previousConnection
@@ -59,12 +61,22 @@ Não coloque credenciais no caminho do relatório. `INBOX_TEST_CONNECTION` é a 
 origem da conexão PostgreSQL; nunca aponte para produção ou outros ambientes.
 
 Smoke: 20 eventos, uma rodada. Padrão: 500 eventos por rodada, três rodadas.
-Ambos incluem um warm-up de 20 eventos e um experimento de recuperação de um
-evento. Os valores são experimentais, configuráveis, sem metas de produção:
+Sem `--scalability`, ambos preservam uma configuração com um worker, warm-up
+separado e recuperação sequencial. Com `--scalability`, a matriz completa tem
+sete configurações nesta ordem: `1-Shared`, `2-Shared`, `2-PerWorker`, `4-Shared`,
+`4-PerWorker`, `8-Shared`, `8-PerWorker`. Um worker com publisher próprio é
+equivalente ao compartilhado e não gera uma oitava configuração.
+
+O smoke concorrente reduz a matriz a `1-Shared`, `2-Shared`, `2-PerWorker`.
+Cada configuração tem seu próprio warm-up de 20 eventos e depois suas rodadas.
+Ao final da matriz há um único experimento separado de recuperação de um evento,
+sempre sequencial. `--workers 1,2,4,8` permite escolher contagens positivas distintas,
+começando por 1 para garantir a nova baseline. Só é aceito com `--scalability`.
+Os valores são experimentais, configuráveis, sem metas de produção:
 
 ```powershell
 dotnet run --project Ordering.Outbox.PublicationBenchmarks -c Release -- `
-    --events 500 --rounds 3 --warmups 1 --warmup-events 20 `
+    --scalability --workers 1,2,4,8 --events 500 --rounds 3 --warmups 1 --warmup-events 20 `
     --batch-timeout-seconds 300 --verification-timeout-seconds 30
 ```
 
@@ -75,6 +87,12 @@ receipt inválido ou identidade inesperada interrompe o lote; o limite adicional
 de tentativas é o tamanho do lote. Falha em uma fase interrompe as fases seguintes.
 Código de saída 0 exige todas as fases e cleanup confirmados; 1 indica execução
 incompleta. Ctrl+C solicita cancelamento cooperativo.
+
+Para evidências de entrega, publique o commit e use um checkout limpo desse SHA,
+compilando nele em Release. Grave os JSONs fora do checkout ou em `artifacts/`
+(ignorado). Confira `Code.GitSha`, `Code.Dirty=false` e os hashes dos assemblies
+em cada relatório; resultados obtidos antes da publicação servem só de pré-validação.
+Não compare a baseline sequencial de outro commit com a baseline nova da matriz.
 
 ## Isolamento e preparação
 
@@ -92,21 +110,70 @@ novo, o tópico e um producer novo por fase restauram condições lógicas equiv
 Não há limpeza de caches do sistema operacional/PostgreSQL; o broker é compartilhado
 entre as fases. A primeira conexão/metadata do producer de cada fase pode contribuir
 para o lote medido. Não se faz tuning ou pré-conexão artificial do producer.
+Warm-up separado por configuração não elimina necessariamente o custo de iniciar
+novas sessões Kafka nas rodadas. Todas as amostras lentas permanecem no relatório.
+
+Cada fase possui um único `NpgsqlDataSource`, compartilhado por todos os workers.
+`PoolSettings` registra os valores efetivos do cliente sem a connection string;
+`PostgreSqlSettings` registra fsync, full_page_writes, synchronous_commit, buffers,
+conexões e parâmetros de WAL/checkpoint sem ajustá-los. Use o mesmo PostgreSQL e
+broker durante toda a matriz, sem mudanças de recursos ou carga externas. O JSON
+registra versões e condições do cliente, ordem planejada (`ConfigurationOrder`),
+ordem efetiva (`ExecutionOrder`) e horários das fases. A ordem fixa, os caches e
+carga externa são possíveis confundidores; não há randomização ou isolamento de CPU.
+
+## Coordenação e topologias
+
+Cada worker tem um owner exclusivo e estável durante a fase e um `OutboxRelay`
+próprio. Uma barreira espera todos os workers ficarem prontos antes de liberar
+o relógio do lote. Cada worker aguarda integralmente seu `RunOnceAsync` antes
+de pedir outra autorização. Uma seção crítica curta serializa a distribuição
+atômica de tickets e a interrupção da admissão; há no máximo tantos tickets
+quanto eventos solicitados. Tickets não atribuem EventIds e não substituem leases,
+fencing ou a aquisição real no PostgreSQL. Não há polling ou retry adicional.
+
+`Shared` entrega a mesma instância de `KafkaOutboxEventPublisher` a todos os relays.
+O `SemaphoreSlim` existente funciona como concurrency gate: serializa acesso ao
+producer até o resultado do envio e protege seu descarte. `PerWorker` cria uma
+instância por worker, cada qual com seu próprio gate e sessão Kafka. A comparação
+modifica **tanto o compartilhamento do gate quanto a quantidade de sessões**;
+diferenças de desempenho não provam isoladamente o custo do semáforo. Não se mede
+diretamente sua espera e a implementação do publisher não é alterada.
+
+Ao observar falha ou cancelamento, o coordenador interrompe novos tickets; chamadas
+já admitidas continuam supervisionadas. `Task.WhenAll` espera os workers reais,
+sem cancelar apenas a espera com `WaitAsync`. Cancelamento não prova conclusão
+de um envio Kafka já enfileirado. A fase é dona dos publishers; somente depois
+da quiescência consolida amostras e descarta todos eles. O escopo externo descarta
+depois o DataSource e o banco. Um relay não descarta um publisher compartilhado.
 
 ## Medição e verificação
 
-O relógio monotônico cobre o lote finito de chamadas sequenciais completas ao relay
-e seu pequeno custo de coordenação. Preparação, gravação de checkpoints JSON e
+O relógio monotônico cobre o lote finito, da liberação da barreira até a conclusão
+de todos os workers, incluindo coordenação e coleta. Preparação, checkpoints JSON e
 consultas de verificação ficam fora desse intervalo. As latências por tentativa
 medem a chamada completa a `RunOnceAsync`. `MeterListener` observa diretamente os
 histogramas existentes de publicação, conclusão e tentativa, convertendo segundos
-em milissegundos. Não existe histograma de aquisição no contrato atual; o console
-não altera a instrumentação para acrescentá-lo.
+em milissegundos. Um `ActivityListener` do laboratório reutiliza a duração da
+Activity `outbox.acquire` existente para aquisição. Não cria histograma ou nova
+instrumentação de produção nem estima aquisição por subtração de percentis.
 
-O JSON conserva todas as amostras e resultados por tentativa: identidade, duração,
+`AsyncLocal` propaga um contexto imutável de tentativa/worker através dos awaits;
+não há propriedade `Attempt` mutável compartilhada. O contexto também identifica
+o coletor para isolar fases simultâneas. Callbacks dos histogramas e Activities
+gravam em `ConcurrentQueue`; a consolidação acontece depois de todos os workers.
+A mesma instrumentação é aplicada a todas as configurações, inclusive um worker.
+Sua sobrecarga faz parte do experimento e não é medida separadamente.
+
+O JSON conserva todas as amostras e resultados por tentativa: número, worker, owner, duração,
 status do relay e delivery, estágio, receipt, sua validade e indicador de resultado
 incerto. Mensagens de exceção não são registradas. p50/p95/p99 usam nearest-rank
 das amostras observadas de cada distribuição; percentis de estágios não são somados.
+`StartedAfterBatchMilliseconds`, `FirstAttempts` (dez primeiras por início) e
+`FirstAttemptPerWorker` permitem investigar cold start sem excluir essas amostras.
+`TelemetryConsistent` exige identidades únicas, owners corretos e exatamente uma
+amostra por etapa e tentativa, com status compatíveis. Amostras faltantes,
+duplicadas, de outro worker ou inconsistentes invalidam a fase normal.
 
 Após parar o relógio, consulta todas as identidades e seus `publication_status`
 persistidos no banco exclusivo. Conta IDs distintos `Published` com timestamp de
@@ -125,6 +192,16 @@ consumidor de verificação não entra no throughput. `MeasuredTotals` exclui wa
 e recuperação; os percentis/throughputs são apresentados por rodada, sem mesclar
 esses cenários. `BaselineValid=false`, `Status=Incomplete` ou
 `Metrics.BaselineEligible=false` tornam números parciais apenas diagnósticos.
+
+Cada rodada inclui contagens de resultados incertos, falhas e duplicatas Kafka.
+`ScalingSummary` conserva throughputs individuais e a mediana entre rodadas por
+configuração (para número par de rodadas, média dos dois valores centrais).
+Speedup por rodada = throughput / throughput de `1-Shared` na mesma rodada;
+o agregado divide as medianas das configurações. Scaling efficiency = speedup /
+número de workers. São razões descritivas de drenagem do lote, sem teste causal
+ou intervalo de confiança. Uma execução incompleta não recebe speedup ou eficiência
+válidos; números parciais continuam disponíveis para diagnóstico. O cleanup dos
+publishers também é necessário para elegibilidade.
 
 Os metadados incluem SHA Git, checkout modificado, hashes dos assemblies, runtime,
 clientes, versão PostgreSQL por fase, imagem e versão Kafka obtida no contêiner.
@@ -183,3 +260,11 @@ dotnet test Ordering.Hosting.Tests -c Release
 dotnet test Ordering.Infrastructure.PostgreSql.Tests -c Release
 git diff --check
 ```
+
+Os testes rápidos também cobrem métricas concorrentes intercaladas, ausência de
+perda/duplicação, isolamento de fases, tickets atômicos, parada após falha,
+supervisão de operações pendentes, modos sequencial/concorrente e fórmulas de
+comparação. Usam sinais assíncronos determinísticos, sem `Thread.Sleep` ou limites
+de desempenho como critério de aprovação. A CI executa esse projeto de testes;
+não executa smoke ou matriz pesada automaticamente. As demais políticas de CI,
+publicação de imagens e deployment permanecem as mesmas.

@@ -25,6 +25,27 @@ public sealed class ReconciliationTests
     }
 
     [Fact]
+    public void ConcurrentCompletionOrderDoesNotChangeDistinctReconciliationAndDuplicateIdsRemainInvalid()
+    {
+        var events = Enumerable.Range(1, 4).Select(i => new ExpectedEvent(Guid.NewGuid(), "order-" + i,
+            "OrderConfirmed", "{}")).ToArray();
+        var attempts = events.Select((e, i) => AttemptSample.Create(i + 1, 1,
+            new(OutboxRelayStatus.Published, OutboxRelayStage.Completion, e.EventId,
+                OutboxDeliveryStatus.Acknowledged, new("topic", 0, i)), "topic", i + 1, "owner-" + i)).Reverse().ToArray();
+        var database = events.Select(e => new DatabaseEvidence(e.EventId, "Published", true)).Reverse().ToArray();
+        var kafka = events.Select((e, i) => new KafkaEvidence(e.EventId, 0, i, true)).ToArray();
+        var result = Reconciler.Check(events, attempts, database, kafka, false);
+        Assert.True(result.Valid);
+        Assert.Equal(4, result.PublishedDistinctIds);
+        Assert.Equal(4, result.KafkaDistinctIds);
+        var duplicate = Reconciler.Check(events, attempts, database,
+            [.. kafka, kafka[0] with { Offset = 4 }], false);
+        Assert.False(duplicate.Valid);
+        Assert.Equal(1, duplicate.DuplicateKafkaRecords);
+        Assert.Equal(4, duplicate.PublishedDistinctIds);
+    }
+
+    [Fact]
     public void EqualAggregateCountsDoNotHideMissingOrUnexpectedIdentities()
     {
         var other = Guid.NewGuid();

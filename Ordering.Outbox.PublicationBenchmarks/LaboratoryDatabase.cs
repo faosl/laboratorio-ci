@@ -31,11 +31,28 @@ internal sealed class LaboratoryDatabase : IAsyncDisposable
             await command.ExecuteNonQueryAsync(ct);
         _created = true;
         _report.DatabaseCleanup = "Pending";
-        Source = NpgsqlDataSource.Create(new NpgsqlConnectionStringBuilder(_connection)
-            { Database = _name, Enlist = false }.ConnectionString);
+        var settings = new NpgsqlConnectionStringBuilder(_connection) { Database = _name, Enlist = false };
+        // One DataSource/pool per phase, shared by every worker; never resize it by topology.
+        Source = NpgsqlDataSource.Create(settings.ConnectionString);
+        _report.PoolSettings = new
+        {
+            settings.Pooling, settings.MinPoolSize, settings.MaxPoolSize, settings.Multiplexing,
+            settings.ConnectionIdleLifetime, settings.ConnectionPruningInterval, settings.ConnectionLifetime,
+            settings.Timeout, settings.CommandTimeout, settings.Enlist
+        };
         await InboxSchema.ApplyAsync(Source, ct);
         await using var version = Source.CreateCommand("SHOW server_version");
         _report.PostgreSqlVersion = (string?)await version.ExecuteScalarAsync(ct);
+        await using var inspect = Source.CreateCommand("""
+            SELECT name, setting, unit FROM pg_settings
+            WHERE name IN ('fsync', 'full_page_writes', 'synchronous_commit', 'max_connections',
+                'shared_buffers', 'wal_level', 'max_wal_size', 'checkpoint_timeout') ORDER BY name
+            """);
+        await using var reader = await inspect.ExecuteReaderAsync(ct);
+        var server = new Dictionary<string, object>();
+        while (await reader.ReadAsync(ct))
+            server.Add(reader.GetString(0), new { Value = reader.GetString(1), Unit = reader.IsDBNull(2) ? null : reader.GetString(2) });
+        _report.PostgreSqlSettings = server;
     }
 
     public async Task SeedAsync(int count, CancellationToken ct)

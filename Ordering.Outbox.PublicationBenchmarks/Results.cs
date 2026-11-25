@@ -7,15 +7,17 @@ internal sealed record ExpectedEvent(Guid EventId, string AggregateId, string Ev
     [property: JsonIgnore] string Payload);
 internal sealed record DatabaseEvidence(Guid EventId, string PublicationStatus, bool HasPublishedAt);
 internal sealed record KafkaEvidence(Guid? EventId, int Partition, long Offset, bool EnvelopeMatches);
-internal sealed record StageSample(int Attempt, string Instrument, string Status, double Milliseconds);
-internal sealed record AttemptSample(int Number, double Milliseconds, OutboxRelayResult Result, bool ValidReceipt)
+internal sealed record StageSample(int Attempt, string Instrument, string Status, double Milliseconds, int Worker = 1);
+internal sealed record AttemptSample(int Number, double Milliseconds, OutboxRelayResult Result, bool ValidReceipt,
+    int Worker = 1, string Owner = "", double StartedAfterBatchMilliseconds = 0)
 {
     public bool Uncertain => Result.Delivery == OutboxDeliveryStatus.Unconfirmed || Result.Status is
         OutboxRelayStatus.AcquisitionUnknown or OutboxRelayStatus.CompletionUnknown or OutboxRelayStatus.RetryUnknown;
 
-    public static AttemptSample Create(int number, double milliseconds, OutboxRelayResult result, string topic) =>
+    public static AttemptSample Create(int number, double milliseconds, OutboxRelayResult result, string topic,
+        int worker = 1, string owner = "", double startedAfterBatchMilliseconds = 0) =>
         new(number, milliseconds, result, result.Receipt is { Partition: >= 0, Offset: >= 0 } receipt
-            && receipt.Topic == topic);
+            && receipt.Topic == topic, worker, owner, startedAfterBatchMilliseconds);
 }
 internal sealed record Percentiles(double P50, double P95, double P99)
 {
@@ -87,12 +89,19 @@ internal static class Reconciler
 
 internal sealed class PhaseReport(string kind, int round, int requestedEvents, string topic)
 {
+    public WorkerConfiguration Configuration { get; init; } = new(1, PublisherTopology.Shared);
+    public int ExecutionOrder { get; init; }
+    public DateTimeOffset StartedAtUtc { get; set; }
+    public DateTimeOffset? FinishedAtUtc { get; set; }
     public string Kind { get; } = kind;
     public int Round { get; } = round;
     public int RequestedEvents { get; } = requestedEvents;
     public string Topic { get; } = topic;
     public string? Database { get; set; }
     public string? PostgreSqlVersion { get; set; }
+    public object? PostgreSqlSettings { get; set; }
+    public object? PoolSettings { get; set; }
+    public List<WorkerIdentity> Workers { get; } = [];
     public List<ExpectedEvent> Expected { get; } = [];
     public List<DatabaseEvidence> PendingBefore { get; } = [];
     public List<AttemptSample> Attempts { get; } = [];
@@ -102,30 +111,62 @@ internal sealed class PhaseReport(string kind, int round, int requestedEvents, s
     public List<DatabaseEvidence> RecoveryBeforeExpiration { get; } = [];
     public List<KafkaEvidence> RecoveryKafkaBeforeExpiration { get; } = [];
     public double? BatchMilliseconds { get; set; }
+    public int TicketsIssued { get; set; }
     public string StopReason { get; set; } = "NotStarted";
     public string? FailureType { get; set; }
     public Reconciliation? Validation { get; set; }
     public bool VerificationReachedEnd { get; set; }
     public bool Complete { get; set; }
     public string DatabaseCleanup { get; set; } = "NotCreated";
+    public string PublisherCleanup { get; set; } = "NotCreated";
+    public bool BaselineEligible => Kind == "benchmark" && Complete && DatabaseCleanup == "Dropped"
+        && PublisherCleanup == "Disposed";
     public bool TelemetryConsistent => Kind == "recovery" ? StageSamples.Count == 0
-        : StageSamples.Count == Attempts.Count * 3 && StageSamples.All(s => s.Attempt >= 1 && s.Attempt <= Attempts.Count)
-            && Attempts.All(a => StageSamples.Count(s => s.Attempt == a.Number
-                    && s.Instrument == OutboxRelayDiagnostics.PublicationDurationName) == 1
-                && StageSamples.Count(s => s.Attempt == a.Number
-                    && s.Instrument == OutboxRelayDiagnostics.CompletionDurationName) == 1
-                && StageSamples.Count(s => s.Attempt == a.Number
-                    && s.Instrument == OutboxRelayDiagnostics.AttemptDurationName) == 1);
+        : TelemetryValidation.Check(Attempts, StageSamples, Workers);
     public object? Metrics => Kind != "benchmark" || BatchMilliseconds is not > 0 ? null : new
     {
-        BaselineEligible = Complete && DatabaseCleanup == "Dropped", BatchMilliseconds,
+        BaselineEligible, BatchMilliseconds,
         AttemptsPerSecond = Attempts.Count / (BatchMilliseconds.Value / 1000),
         KafkaAcksPerSecond = Validation?.KafkaAcks / (BatchMilliseconds.Value / 1000),
         DistinctPublishedPerSecond = Validation?.PublishedDistinctIds / (BatchMilliseconds.Value / 1000),
+        Uncertain = Attempts.Count(a => a.Uncertain),
+        Failures = Attempts.Count(a => a.Result.Status != OutboxRelayStatus.Published),
+        Duplicates = Validation?.DuplicateKafkaRecords,
+        FirstAttempts = Attempts.OrderBy(a => a.StartedAfterBatchMilliseconds).Take(10).ToArray(),
+        FirstAttemptPerWorker = Attempts.GroupBy(a => a.Worker).Select(g => g.OrderBy(a => a.Number).First()).ToArray(),
         AttemptLatencyMs = Percentiles.From(Attempts.Select(a => a.Milliseconds)),
         Stages = StageSamples.GroupBy(s => s.Instrument).Select(g => new
         {
             Instrument = g.Key, Count = g.Count(), LatencyMs = Percentiles.From(g.Select(s => s.Milliseconds))
         }).ToArray()
     };
+}
+
+internal sealed record WorkerIdentity(int Worker, string Owner);
+
+internal static class TelemetryValidation
+{
+    private static readonly string[] Instruments = [StageCollector.AcquisitionName,
+        OutboxRelayDiagnostics.PublicationDurationName, OutboxRelayDiagnostics.CompletionDurationName,
+        OutboxRelayDiagnostics.AttemptDurationName];
+
+    public static bool Check(IReadOnlyList<AttemptSample> attempts, IReadOnlyList<StageSample> samples,
+        IReadOnlyList<WorkerIdentity> workers) =>
+        attempts.Select(a => a.Number).Distinct().Count() == attempts.Count
+        && attempts.Select(a => a.Number).Order().SequenceEqual(Enumerable.Range(1, attempts.Count))
+        && workers.Select(w => w.Worker).Distinct().Count() == workers.Count
+        && workers.Select(w => w.Owner).Distinct().Count() == workers.Count
+        && samples.Count == attempts.Count * Instruments.Length
+        && samples.All(s => double.IsFinite(s.Milliseconds) && s.Milliseconds >= 0
+            && attempts.Any(a => a.Number == s.Attempt && a.Worker == s.Worker))
+        && attempts.All(a => workers.Any(w => w.Worker == a.Worker && w.Owner == a.Owner)
+            && double.IsFinite(a.Milliseconds) && a.Milliseconds >= 0
+            && Instruments.All(i => samples.Count(s => s.Attempt == a.Number && s.Worker == a.Worker && s.Instrument == i) == 1)
+            && samples.Single(s => s.Attempt == a.Number && s.Instrument == OutboxRelayDiagnostics.AttemptDurationName)
+                .Status == a.Result.Status.ToString()
+            && samples.Single(s => s.Attempt == a.Number && s.Instrument == StageCollector.AcquisitionName).Status == "Acquired"
+            && samples.Single(s => s.Attempt == a.Number && s.Instrument == OutboxRelayDiagnostics.PublicationDurationName)
+                .Status == a.Result.Delivery.ToString()
+            && samples.Single(s => s.Attempt == a.Number && s.Instrument == OutboxRelayDiagnostics.CompletionDurationName)
+                .Status == "Succeeded");
 }

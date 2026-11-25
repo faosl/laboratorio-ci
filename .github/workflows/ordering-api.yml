@@ -44,6 +44,10 @@ jobs:
         run: |
           dotnet restore Ordering.Hosting.Tests/Ordering.Hosting.Tests.csproj
           dotnet test Ordering.Hosting.Tests/Ordering.Hosting.Tests.csproj -c Release --no-restore
+      - name: Run publication benchmark unit tests (no services)
+        run: |
+          dotnet restore Ordering.Outbox.PublicationBenchmarks.Tests/Ordering.Outbox.PublicationBenchmarks.Tests.csproj
+          dotnet test Ordering.Outbox.PublicationBenchmarks.Tests/Ordering.Outbox.PublicationBenchmarks.Tests.csproj -c Release --no-restore
       - name: Run partner contract unit tests
         run: |
           dotnet restore Ordering.Contracts.Partners.Tests/Ordering.Contracts.Partners.Tests.csproj
