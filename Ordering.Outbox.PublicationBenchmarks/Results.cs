@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using Ordering.Application.Outbox;
+using Ordering.Infrastructure.Kafka;
 
 namespace Ordering.Outbox.PublicationBenchmarks;
 
@@ -134,6 +135,7 @@ internal sealed class PhaseReport(string kind, int round, int requestedEvents, s
         Duplicates = Validation?.DuplicateKafkaRecords,
         FirstAttempts = Attempts.OrderBy(a => a.StartedAfterBatchMilliseconds).Take(10).ToArray(),
         FirstAttemptPerWorker = Attempts.GroupBy(a => a.Worker).Select(g => g.OrderBy(a => a.Number).First()).ToArray(),
+        WaitShareOfPublication = Percentiles.From(TelemetryValidation.WaitShares(StageSamples)),
         AttemptLatencyMs = Percentiles.From(Attempts.Select(a => a.Milliseconds)),
         Stages = StageSamples.GroupBy(s => s.Instrument).Select(g => new
         {
@@ -146,27 +148,103 @@ internal sealed record WorkerIdentity(int Worker, string Owner);
 
 internal static class TelemetryValidation
 {
-    private static readonly string[] Instruments = [StageCollector.AcquisitionName,
-        OutboxRelayDiagnostics.PublicationDurationName, OutboxRelayDiagnostics.CompletionDurationName,
-        OutboxRelayDiagnostics.AttemptDurationName];
+    // A ratio belongs to one publication. Never divide independently ranked percentiles.
+    public static IEnumerable<double> WaitShares(IEnumerable<StageSample> samples)
+    {
+        foreach (var group in samples.Where(s => s.Instrument is KafkaOutboxDiagnostics.WaitName
+                     or OutboxRelayDiagnostics.PublicationDurationName).GroupBy(s => (s.Attempt, s.Worker)))
+        {
+            if (group.Count() != 2) continue;
+            var wait = group.FirstOrDefault(s => s.Instrument == KafkaOutboxDiagnostics.WaitName);
+            var publication = group.FirstOrDefault(s => s.Instrument == OutboxRelayDiagnostics.PublicationDurationName);
+            if (wait is { Milliseconds: >= 0 } && publication is { Milliseconds: > 0 }
+                && double.IsFinite(publication.Milliseconds) && wait.Milliseconds <= publication.Milliseconds)
+                yield return wait.Milliseconds / publication.Milliseconds;
+        }
+    }
 
     public static bool Check(IReadOnlyList<AttemptSample> attempts, IReadOnlyList<StageSample> samples,
-        IReadOnlyList<WorkerIdentity> workers) =>
-        attempts.Select(a => a.Number).Distinct().Count() == attempts.Count
-        && attempts.Select(a => a.Number).Order().SequenceEqual(Enumerable.Range(1, attempts.Count))
-        && workers.Select(w => w.Worker).Distinct().Count() == workers.Count
-        && workers.Select(w => w.Owner).Distinct().Count() == workers.Count
-        && samples.Count == attempts.Count * Instruments.Length
-        && samples.All(s => double.IsFinite(s.Milliseconds) && s.Milliseconds >= 0
-            && attempts.Any(a => a.Number == s.Attempt && a.Worker == s.Worker))
-        && attempts.All(a => workers.Any(w => w.Worker == a.Worker && w.Owner == a.Owner)
-            && double.IsFinite(a.Milliseconds) && a.Milliseconds >= 0
-            && Instruments.All(i => samples.Count(s => s.Attempt == a.Number && s.Worker == a.Worker && s.Instrument == i) == 1)
-            && samples.Single(s => s.Attempt == a.Number && s.Instrument == OutboxRelayDiagnostics.AttemptDurationName)
-                .Status == a.Result.Status.ToString()
-            && samples.Single(s => s.Attempt == a.Number && s.Instrument == StageCollector.AcquisitionName).Status == "Acquired"
-            && samples.Single(s => s.Attempt == a.Number && s.Instrument == OutboxRelayDiagnostics.PublicationDurationName)
-                .Status == a.Result.Delivery.ToString()
-            && samples.Single(s => s.Attempt == a.Number && s.Instrument == OutboxRelayDiagnostics.CompletionDurationName)
-                .Status == "Succeeded");
+        IReadOnlyList<WorkerIdentity> workers)
+    {
+        if (!attempts.Select(a => a.Number).Order().SequenceEqual(Enumerable.Range(1, attempts.Count))
+            || workers.DistinctBy(w => w.Worker).Count() != workers.Count
+            || workers.DistinctBy(w => w.Owner).Count() != workers.Count)
+            return false;
+        var byAttempt = samples.ToLookup(s => (s.Attempt, s.Worker));
+        var matched = 0;
+        foreach (var attempt in attempts)
+        {
+            var stages = byAttempt[(attempt.Number, attempt.Worker)].ToArray();
+            if (!workers.Contains(new(attempt.Worker, attempt.Owner))
+                || !double.IsFinite(attempt.Milliseconds) || attempt.Milliseconds < 0
+                || !ValidStages(attempt.Result, stages))
+                return false;
+            matched += stages.Length;
+        }
+        return matched == samples.Count;
+    }
+
+    private static bool ValidStages(OutboxRelayResult result, StageSample[] stages)
+    {
+        if (stages.Any(s => !double.IsFinite(s.Milliseconds) || s.Milliseconds < 0)
+            || stages.DistinctBy(s => s.Instrument).Count() != stages.Length)
+            return false;
+
+        var remaining = stages.ToDictionary(s => s.Instrument);
+        bool FitsWithin(string inner, string outer) =>
+            !remaining.TryGetValue(inner, out var child) || (remaining.TryGetValue(outer, out var parent)
+                && child.Milliseconds <= parent.Milliseconds);
+        if (!FitsWithin(KafkaOutboxDiagnostics.WaitName, OutboxRelayDiagnostics.PublicationDurationName)
+            || !FitsWithin(KafkaOutboxDiagnostics.HoldName, OutboxRelayDiagnostics.PublicationDurationName)
+            || !FitsWithin(KafkaOutboxDiagnostics.ProduceName, KafkaOutboxDiagnostics.HoldName))
+            return false;
+        string? Take(string name) => remaining.Remove(name, out var sample) ? sample.Status : null;
+        if (Take(OutboxRelayDiagnostics.AttemptDurationName) != result.Status.ToString()) return false;
+
+        var acquisition = Take(StageCollector.AcquisitionName);
+        if (result.Stage == OutboxRelayStage.Acquisition)
+            return remaining.Count == 0 && result.Status switch
+            {
+                OutboxRelayStatus.NoEligibleWork => acquisition == "NoEligibleWork",
+                OutboxRelayStatus.AcquisitionUnknown => acquisition == "OutcomeUnknown",
+                OutboxRelayStatus.Cancelled => acquisition is null or "Cancelled",
+                _ => acquisition is "Exception" or "Acquired"
+            };
+        if (acquisition != "Acquired") return false;
+        if (result.Stage == OutboxRelayStage.Validation) return remaining.Count == 0;
+
+        var publication = Take(OutboxRelayDiagnostics.PublicationDurationName);
+        var wait = Take(KafkaOutboxDiagnostics.WaitName);
+        var hold = Take(KafkaOutboxDiagnostics.HoldName);
+        var produce = Take(KafkaOutboxDiagnostics.ProduceName);
+        if (result.Stage == OutboxRelayStage.Completion)
+        {
+            if (publication != "Acknowledged") return false;
+            var completion = Take(OutboxRelayDiagnostics.CompletionDurationName);
+            var expected = result.Status switch
+            {
+                OutboxRelayStatus.Published => "Succeeded",
+                OutboxRelayStatus.LeaseLost => "LeaseLost",
+                OutboxRelayStatus.CompletionUnknown => "OutcomeUnknown",
+                OutboxRelayStatus.Cancelled => "Cancelled",
+                _ => "Exception"
+            };
+            if (completion != expected) return false;
+        }
+        if (result.Stage == OutboxRelayStage.Retry && publication != "Unconfirmed") return false;
+        if (remaining.Count != 0) return false;
+        // A failed wait owns nothing. A failed publication after entry can precede ProduceAsync.
+        if (wait != "Acquired")
+            return result.Stage == OutboxRelayStage.Publication && hold is null && produce is null
+                && (wait, publication) is ("Cancelled", "Cancelled") or ("Exception", "Exception");
+        if (hold != "Released") return false;
+        return publication switch
+        {
+            "Acknowledged" => produce == "Acknowledged" && result.Delivery == OutboxDeliveryStatus.Acknowledged,
+            "Unconfirmed" => produce is "Unconfirmed" or "Exception" && result.Delivery == OutboxDeliveryStatus.Unconfirmed,
+            "Cancelled" => result.Stage == OutboxRelayStage.Publication && produce is null or "Cancelled",
+            "Exception" => result.Stage == OutboxRelayStage.Publication && produce is null or "Exception" or "Cancelled",
+            _ => false
+        };
+    }
 }

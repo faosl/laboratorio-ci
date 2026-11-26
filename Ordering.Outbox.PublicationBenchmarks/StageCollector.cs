@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using Ordering.Application.Outbox;
+using Ordering.Infrastructure.Kafka;
 
 namespace Ordering.Outbox.PublicationBenchmarks;
 
@@ -32,9 +33,14 @@ internal sealed class StageCollector : IDisposable
         ActivitySource.AddActivityListener(_activities);
         _listener.InstrumentPublished = (instrument, listener) =>
         {
-            if (instrument.Meter.Name == OutboxRelayDiagnostics.SourceName
-                && instrument.Name is OutboxRelayDiagnostics.PublicationDurationName
-                    or OutboxRelayDiagnostics.CompletionDurationName or OutboxRelayDiagnostics.AttemptDurationName)
+            if (instrument is Histogram<double> && instrument.Meter.Name switch
+                {
+                    OutboxRelayDiagnostics.SourceName => instrument.Name is OutboxRelayDiagnostics.PublicationDurationName
+                        or OutboxRelayDiagnostics.CompletionDurationName or OutboxRelayDiagnostics.AttemptDurationName,
+                    KafkaOutboxDiagnostics.MeterName => instrument.Name is KafkaOutboxDiagnostics.WaitName
+                        or KafkaOutboxDiagnostics.HoldName or KafkaOutboxDiagnostics.ProduceName,
+                    _ => false
+                })
                 listener.EnableMeasurementEvents(instrument);
         };
         _listener.SetMeasurementEventCallback<double>((instrument, value, tags, _) =>

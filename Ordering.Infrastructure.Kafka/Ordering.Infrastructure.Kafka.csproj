@@ -8,5 +8,6 @@
     <ProjectReference Include="../Ordering.Application/Ordering.Application.csproj" />
     <PackageReference Include="Confluent.Kafka" Version="2.12.0" />
     <InternalsVisibleTo Include="Ordering.Infrastructure.PostgreSql.Tests" />
+    <InternalsVisibleTo Include="Ordering.Outbox.PublicationBenchmarks.Tests" />
   </ItemGroup>
 </Project>

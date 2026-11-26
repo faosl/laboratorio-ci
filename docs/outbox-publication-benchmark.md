@@ -8,7 +8,19 @@ ACKs, retries, idempotência, leases, fencing, pool ou cancelamento da implement
 Executa o fluxo real por `OutboxRelay.RunOnceAsync`, com
 `PostgresOutboxProcessingStore` e `KafkaOutboxEventPublisher`. Não há doubles de
 publicação no benchmark normal. O modo padrão mantém um worker sequencial.
-`--scalability` habilita a matriz concorrente do incremento 8.
+`--scalability` habilita a matriz concorrente. Para o experimento de contenção,
+execute o smoke e depois a matriz focal no checkout limpo do mesmo commit:
+
+```powershell
+dotnet run --project Ordering.Outbox.PublicationBenchmarks -c Release -- --smoke --scalability --workers 1,8 --balanced-order --output artifacts/contention-smoke.json
+dotnet run --project Ordering.Outbox.PublicationBenchmarks -c Release --no-build -- --scalability --workers 1,8 --balanced-order --rounds 4 --events 500 --output artifacts/contention-focal.json
+```
+
+`--balanced-order` executa os warm-ups de todas as configurações primeiro. Em
+cada rodada medida, executa a baseline de um worker e percorre as contagens de
+workers na ordem pedida. Para cada contagem maior que um, Shared vem primeiro
+nas rodadas ímpares e PerWorker nas pares. O comando focal mede 6.000 eventos
+em 12 lotes. A recuperação acontece após o último lote.
 
 ## Execução PowerShell
 
@@ -137,8 +149,8 @@ O `SemaphoreSlim` existente funciona como concurrency gate: serializa acesso ao
 producer até o resultado do envio e protege seu descarte. `PerWorker` cria uma
 instância por worker, cada qual com seu próprio gate e sessão Kafka. A comparação
 modifica **tanto o compartilhamento do gate quanto a quantidade de sessões**;
-diferenças de desempenho não provam isoladamente o custo do semáforo. Não se mede
-diretamente sua espera e a implementação do publisher não é alterada.
+diferenças de desempenho não provam isoladamente o custo do semáforo. A medida
+direta de espera permite observar a contenção dentro de cada publicação.
 
 Ao observar falha ou cancelamento, o coordenador interrompe novos tickets; chamadas
 já admitidas continuam supervisionadas. `Task.WhenAll` espera os workers reais,
@@ -155,8 +167,30 @@ consultas de verificação ficam fora desse intervalo. As latências por tentati
 medem a chamada completa a `RunOnceAsync`. `MeterListener` observa diretamente os
 histogramas existentes de publicação, conclusão e tentativa, convertendo segundos
 em milissegundos. Um `ActivityListener` do laboratório reutiliza a duração da
-Activity `outbox.acquire` existente para aquisição. Não cria histograma ou nova
-instrumentação de produção nem estima aquisição por subtração de percentis.
+Activity `outbox.acquire` existente para aquisição.
+
+O Meter `Ordering.Infrastructure.Kafka.Outbox` expõe três histogramas locais
+em segundos. Os nomes fazem parte do contrato deste repositório. O publisher
+usa `Stopwatch` e a única dimensão agregada é `outbox.status`.
+
+| Histograma | Fronteiras e resultado |
+|---|---|
+| `outbox.kafka.gate.wait.duration` | **Wait time** desde imediatamente antes de `WaitAsync` até a continuação observar aquisição, cancelamento ou exceção. Inclui reagendamento da continuação. Status `Acquired`, `Cancelled` ou `Exception`. |
+| `outbox.kafka.gate.hold.duration` | **Hold time** desde a aquisição confirmada até imediatamente antes de `Release`. Cobre a **critical section** que mantém a **mutual exclusion**. Status `Released`. |
+| `outbox.kafka.produce.duration` | Da chamada a `ProduceAsync`, com o envelope já pronto, até observar seu retorno ou exceção. Inclui o caminho do cliente até o delivery report. Status `Acknowledged` ou `Unconfirmed` para retornos, `Cancelled` ou `Exception` para lançamentos. Uma `KafkaException` gera `Exception` no envio e `Unconfirmed` na publicação. |
+
+A espera mede o tempo associado a **semaphore contention**, incluindo o custo
+de aquisição sem disputa. O envio está contido na posse. Somá-los contaria o
+envio duas vezes. A duração do envio também inclui transporte, retries e
+agendamento do cliente, além do trabalho do broker. Os callbacks são executados
+após a liberação, ou após uma espera malsucedida. Um cancelamento antes do
+envio preserva apenas as etapas percorridas. O descarte não produz amostras.
+
+Em cada rodada, `Metrics.WaitShareOfPublication` apresenta p50, p95 e p99 da
+razão entre espera e publicação. Cada razão usa o mesmo par `(Attempt, Worker)`
+em `StageSamples` e publicação de duração positiva. Multiplique por 100 para
+obter a porcentagem. Uma tentativa publicada fornece sete amostras, inclusive
+quando a espera é curta. Os percentis são calculados depois do pareamento.
 
 `AsyncLocal` propaga um contexto imutável de tentativa/worker através dos awaits;
 não há propriedade `Attempt` mutável compartilhada. O contexto também identifica

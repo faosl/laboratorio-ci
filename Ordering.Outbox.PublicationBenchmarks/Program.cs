@@ -19,6 +19,7 @@ if (args.Contains("--help"))
         --smoke                      defaults: 20 events, 1 round (normal: 500 events, 3 rounds)
         --scalability                opt-in matrix: 1 Shared; 2,4,8 Shared and PerWorker
         --workers 1,2,4,8             requires scalability; smoke defaults to 1,2 (3 configurations)
+        --balanced-order             all warm-ups first; alternate Shared/PerWorker order each round
         --events N --rounds N --warmups N --warmup-events N
         --batch-timeout-seconds N     default 300; stop on first non-success, no benchmark retries
         --verification-timeout-seconds N  default 30
@@ -41,7 +42,8 @@ var report = new Dictionary<string, object?>
         RelayOptions = "Unmodified defaults: lease 60s, execution timeout 40s, safety margin 10s, retry delay 5s",
         Reset = "Fresh random database, migrated schema, new confirmed orders and exclusive topic for EVERY phase",
         Measurement = "Monotonic finite-batch wall time: start barrier release through all worker completions; preparation and verification excluded",
-        Stages = "Activity outbox.acquire duration; existing publication, completion, relay attempt histograms; identical correlation/instrumentation across configurations",
+        Stages = "PostgreSQL acquisition activity; gate wait, gate hold, producer call, publication, completion and relay attempt histograms",
+        WaitShareOfPublication = "Nearest-rank distribution of gate wait / publication duration paired by attempt and worker; positive denominators only",
         Warmup = "Separate phase per configuration; fresh producers in measured phases can still pay Kafka session cold-start cost; no slow samples removed",
         Topology = "Shared preserves existing SemaphoreSlim; PerWorker changes gate sharing AND producer sessions, so differences do not isolate semaphore cost",
         Percentiles = "Nearest-rank from observed samples, independently per instrument; never sum stage percentiles",
@@ -90,14 +92,9 @@ try
     if (version.ExitCode != 0) throw new InvalidOperationException("Kafka version unavailable.");
     report["KafkaVersion"] = Regex.Match(version.Stdout, @"\b\d+\.\d+\.\d+[\w.-]*").Value;
     var bootstrap = broker.GetBootstrapAddress();
-    foreach (var configuration in options.Configurations)
-    {
-        for (var i = 1; i <= options.Warmups; i++)
-            if (!await RunAsync("warmup", i, options.WarmupEvents, configuration)) throw new InvalidOperationException("Warm-up incomplete.");
-        for (var i = 1; i <= options.Rounds; i++)
-            if (!await RunAsync("benchmark", i, options.Events, configuration)) throw new InvalidOperationException("Round incomplete.");
-    }
-    if (!await RunAsync("recovery", 1, 1, new(1, PublisherTopology.Shared))) throw new InvalidOperationException("Recovery incomplete.");
+    foreach (var phase in options.Phases())
+        if (!await RunAsync(phase.Kind, phase.Round, phase.Events, phase.Configuration))
+            throw new InvalidOperationException($"Incomplete {phase.Kind} phase.");
     report["Status"] = "Completed";
     report["BaselineValid"] = true;
     exitCode = 0;

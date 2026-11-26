@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using Confluent.Kafka;
 using Ordering.Application.Outbox;
@@ -61,12 +62,30 @@ public sealed class KafkaOutboxEventPublisher : IOutboxEventPublisher, IDisposab
             .Build();
     }
 
+    internal KafkaOutboxEventPublisher(IProducer<string, byte[]> producer, string topic, TimeSpan deliveryTimeout)
+    {
+        _producer = producer;
+        _topic = topic;
+        DeliveryTimeout = deliveryTimeout;
+    }
+
     public async Task<OutboxPublicationResult> PublishAsync(OutboxMessage message, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(message);
         if (message.EventType != nameof(OrderConfirmed) || message.EventId == Guid.Empty)
             throw new ArgumentException("Only persisted OrderConfirmed events are supported.", nameof(message));
-        await _gate.WaitAsync(cancellationToken);
+        long? produceStart = null;
+        long produceEnd = 0;
+        var produceStatus = "Exception";
+        var waitStart = Stopwatch.GetTimestamp();
+        try { await _gate.WaitAsync(cancellationToken); }
+        catch (Exception error)
+        {
+            KafkaOutboxDiagnostics.Record(KafkaOutboxDiagnostics.WaitName, waitStart, Stopwatch.GetTimestamp(),
+                error is OperationCanceledException ? "Cancelled" : "Exception");
+            throw;
+        }
+        var acquired = Stopwatch.GetTimestamp();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -76,7 +95,7 @@ public sealed class KafkaOutboxEventPublisher : IOutboxEventPublisher, IDisposab
                 // Delivery acknowledgement comes from the delivery report, not local enqueue.
                 // Do not cancel this Task after enqueue: message.timeout.ms bounds native retries
                 // and we keep supervising the send even when the caller requests shutdown.
-                var delivery = await _producer.ProduceAsync(_topic, new Message<string, byte[]>
+                var envelope = new Message<string, byte[]>
                 {
                     Key = message.AggregateId,
                     Value = Encoding.UTF8.GetBytes(message.Payload),
@@ -85,7 +104,12 @@ public sealed class KafkaOutboxEventPublisher : IOutboxEventPublisher, IDisposab
                         { "event-id", Encoding.UTF8.GetBytes(message.EventId.ToString("D")) },
                         { "event-type", Encoding.UTF8.GetBytes(message.EventType) }
                     }
-                }, CancellationToken.None);
+                };
+                DeliveryResult<string, byte[]> delivery;
+                produceStart = Stopwatch.GetTimestamp();
+                try { delivery = await _producer.ProduceAsync(_topic, envelope, CancellationToken.None); }
+                finally { produceEnd = Stopwatch.GetTimestamp(); }
+                produceStatus = delivery.Status == PersistenceStatus.Persisted ? "Acknowledged" : "Unconfirmed";
                 return delivery.Status == PersistenceStatus.Persisted
                     ? new(OutboxDeliveryStatus.Acknowledged,
                         new(delivery.Topic, delivery.Partition.Value, delivery.Offset.Value))
@@ -95,8 +119,22 @@ public sealed class KafkaOutboxEventPublisher : IOutboxEventPublisher, IDisposab
             {
                 return new(OutboxDeliveryStatus.Unconfirmed, ErrorCode: error.Error.Code.ToString());
             }
+            catch (OperationCanceledException)
+            {
+                produceStatus = "Cancelled";
+                throw;
+            }
         }
-        finally { _gate.Release(); }
+        finally
+        {
+            var releasing = Stopwatch.GetTimestamp();
+            _gate.Release();
+            // Emit outside the critical section. Hold time includes the supervised producer call.
+            KafkaOutboxDiagnostics.Record(KafkaOutboxDiagnostics.WaitName, waitStart, acquired, "Acquired");
+            KafkaOutboxDiagnostics.Record(KafkaOutboxDiagnostics.HoldName, acquired, releasing, "Released");
+            if (produceStart is long started)
+                KafkaOutboxDiagnostics.Record(KafkaOutboxDiagnostics.ProduceName, started, produceEnd, produceStatus);
+        }
     }
 
     public async ValueTask DisposeAsync()
